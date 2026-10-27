@@ -54,7 +54,7 @@ _PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<nav><a href="/">Dashboard</a><a href="/team">Team &amp; throughput</a><a href="/lanes">Tasks (lanes)</a><a href="/progress">Log progress</a></nav>
+<nav><a href="/">Dashboard</a><a href="/team">Team &amp; throughput</a><a href="/lanes">Tasks (lanes)</a><a href="/progress">Log progress</a><a href="/sync">Sync (Google Sheets)</a></nav>
 {flash}
 {body}
 </body>
@@ -120,6 +120,8 @@ class PlannerHandler(BaseHTTPRequestHandler):
                 self._page(self._lanes_page())
             elif path == "/progress":
                 self._page(self._progress_page())
+            elif path == "/sync":
+                self._page(self._sync_page())
             else:
                 self._send("not found", 404)
         except StoreError as exc:
@@ -166,6 +168,27 @@ class PlannerHandler(BaseHTTPRequestHandler):
             elif path == "/lanes/delete":
                 self.st.delete_lane(get("data_type"), get("purpose"), get("batch"))
                 self._redirect("/lanes")
+            elif path == "/sync/set":
+                from .sheets import set_sheet_id, set_sheet_prefix
+
+                prefix = get("prefix")
+                if prefix:
+                    set_sheet_prefix(self.st, prefix)
+                for suffix in ("team", "lanes", "progress"):
+                    sid = get(f"id_{suffix}")
+                    if sid:
+                        set_sheet_id(self.st, suffix, sid)
+                self._redirect("/sync")
+            elif path == "/sync/pull":
+                from .sheets import pull
+
+                result = pull(self.st, get("prefix") or None)
+                self._redirect(
+                    f"/sync?ok=1&lanes={result.lanes_replaced}"
+                    f"&added={result.progress_added}"
+                    f"&merged={result.progress_updated}"
+                    f"&team={int(result.team_synced)}"
+                )
             elif path == "/progress/add":
                 day = parse_date(get("date"))
                 if day is None:
@@ -318,6 +341,56 @@ class PlannerHandler(BaseHTTPRequestHandler):
 </table>
 """
         return f"<h1>Tasks (lanes)</h1><p>Each row is one labeling task: a batch broken down by data type and purpose.</p>{table}"
+
+    def _sync_page(self) -> str:
+        from urllib.parse import parse_qs as _pqs
+
+        from .sheets import get_sheet_ids, get_sheet_prefix
+
+        prefix = get_sheet_prefix(self.st) or ""
+        ids = get_sheet_ids(self.st)
+        query = _pqs(urlparse(self.path).query)
+        ok = query.get("ok", [""])[0]
+        banner = ""
+        if ok == "1":
+            banner = (
+                '<div class="flash">Sync complete: '
+                f"team {'updated' if query.get('team', ['0'])[0] == '1' else 'no row'}, "
+                f"{query.get('lanes', ['0'])[0]} lane(s) replaced, "
+                f"{query.get('added', ['0'])[0]} new progress entries, "
+                f"{query.get('merged', ['0'])[0]} merged into existing day(s).</div>"
+            )
+        return f"""
+<h1>Sync with Google Sheets</h1>
+{banner}
+<p>Edit your data in Google Sheets, then pull it here. The tool looks for three
+spreadsheets whose titles start with the prefix below:</p>
+<ul>
+<li><code>&lt;prefix&gt; - team</code> &nbsp;(columns: total_hc, throughput_per_day)</li>
+<li><code>&lt;prefix&gt; - lanes</code> &nbsp;(columns: data_type, purpose, batch, total_required, assigned_hc, status)</li>
+<li><code>&lt;prefix&gt; - progress</code> &nbsp;(columns: date, data_type, purpose, batch, items_completed)</li>
+</ul>
+<form method="post" action="/sync/set">
+<p>Sheet title prefix (used to auto-find your sheets):
+<input name="prefix" value="{esc(prefix)}" size="40">
+<button type="submit">Save</button></p>
+<p>Or paste the exact spreadsheet IDs (the long string in each sheet's URL):</p>
+<table>
+<tr><th>team</th><td><input name="id_team" value="{esc(ids.get('team', ''))}" size="45"></td></tr>
+<tr><th>lanes</th><td><input name="id_lanes" value="{esc(ids.get('lanes', ''))}" size="45"></td></tr>
+<tr><th>progress</th><td><input name="id_progress" value="{esc(ids.get('progress', ''))}" size="45"></td></tr>
+</table>
+<p><button type="submit">Save</button></p>
+</form>
+<form method="post" action="/sync/pull">
+<input type="hidden" name="prefix" value="{esc(prefix)}">
+<p><button type="submit">Pull from Google Sheets now</button></p>
+</form>
+<p><b>Sharing:</b> each spreadsheet must be shared as
+&ldquo;Anyone with the link&rdquo; &rarr; Viewer. The tool only reads them.</p>
+<p><b>Merge rules:</b> team and lanes are replaced from the sheets; progress is
+merged (items summed per date + task), so entries logged in this UI are kept.</p>
+"""
 
     def _progress_page(self) -> str:
         lanes = self.st.list_lanes()

@@ -5,6 +5,10 @@ Usage:
 
 Commands:
     init                          create the CSV files in --dir
+    sheet set PREFIX              link Google Sheets by title ('<PREFIX> - team/lanes/progress')
+    sheet set-id TAB SHEET_ID     link one spreadsheet by its exact ID (team|lanes|progress)
+    sheet show
+    sync [--prefix PREFIX]        pull data from the linked Google Sheets
     web [--host H] [--port P]     launch the web UI (default 127.0.0.1:8000)
     team set HC THROUGHPUT        set total HC and throughput (items/HC/day)
     team show
@@ -60,6 +64,48 @@ def _print_table(headers: list[str], rows: list[list[str]]) -> None:
 def cmd_init(store: Store, args: argparse.Namespace) -> int:
     store.init()
     print(f"initialized planner data in {store.root.resolve()}")
+    return 0
+
+
+def cmd_sheet_set(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import set_sheet_prefix
+
+    set_sheet_prefix(store, args.prefix)
+    print(f"sheet prefix set: {args.prefix!r}")
+    print("Expected sheet titles: '<prefix> - team', '<prefix> - lanes', '<prefix> - progress'")
+    return 0
+
+
+def cmd_sheet_set_id(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import set_sheet_id
+
+    set_sheet_id(store, args.suffix, args.sheet_id)
+    print(f"sheet id for '{args.suffix}' set: {args.sheet_id}")
+    return 0
+
+
+def cmd_sheet_show(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import get_sheet_ids, get_sheet_prefix
+
+    prefix = get_sheet_prefix(store)
+    ids = get_sheet_ids(store)
+    print(f"sheet prefix: {prefix or '(not configured)'}")
+    for suffix in ("team", "lanes", "progress"):
+        print(f"sheet id [{suffix}]: {ids.get(suffix, '(not set)')}")
+    return 0
+
+
+def cmd_sync(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import pull
+
+    result = pull(store, args.prefix)
+    print(f"synced from sheets (prefix {result.source!r}):")
+    print(f"  team: {'updated' if result.team_synced else 'no row found'}")
+    print(f"  lanes: {result.lanes_replaced} replaced")
+    print(
+        f"  progress: {result.progress_added} new, "
+        f"{result.progress_updated} merged into existing day(s)"
+    )
     return 0
 
 
@@ -259,6 +305,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the CSV files").set_defaults(func=cmd_init)
+
+    p = sub.add_parser("sheet", help="configure the Google Sheets source")
+    sheet_sub = p.add_subparsers(dest="sheet_command", required=True)
+    s = sheet_sub.add_parser("set", help="set the sheet title prefix, e.g. 'Annotation Planner Data'")
+    s.add_argument("prefix")
+    s.set_defaults(func=cmd_sheet_set)
+    si = sheet_sub.add_parser("set-id", help="set the exact spreadsheet ID for one table (team|lanes|progress)")
+    si.add_argument("suffix", help="team, lanes, or progress")
+    si.add_argument("sheet_id", help="the long ID from the spreadsheet URL")
+    si.set_defaults(func=cmd_sheet_set_id)
+    sheet_sub.add_parser("show").set_defaults(func=cmd_sheet_show)
+
+    sy = sub.add_parser("sync", help="pull data from the linked Google Sheets")
+    sy.add_argument("--prefix", help="override the configured sheet title prefix")
+    sy.set_defaults(func=cmd_sync)
 
     w = sub.add_parser("web", help="launch the web UI")
     w.add_argument("--host", default="127.0.0.1")

@@ -113,6 +113,19 @@ def _parse_float(value: str, field: str) -> float:
         raise StoreError(f"invalid {field}: {value!r} (expected a number)")
 
 
+def _parse_progress_date(value: str) -> date:
+    """Parse a progress date. Sheets may export dates as 'YYYY-MM-DD HH:MM:SS'."""
+    value = value.strip()
+    parsed = parse_date(value)
+    if parsed is not None:
+        return parsed
+    if len(value) > 10:
+        parsed = parse_date(value[:10])
+        if parsed is not None:
+            return parsed
+    raise StoreError(f"invalid date: {value!r} (expected YYYY-MM-DD)")
+
+
 class Store:
     def __init__(self, root: str | Path):
         self.root = Path(root)
@@ -267,6 +280,39 @@ class Store:
             raise StoreError(f"no lane for {data_type}/{purpose}/{batch}")
         self._write("lanes", kept)
 
+    def replace_lanes(self, lanes: list[Lane]) -> None:
+        """Replace all lanes (used by sheet sync)."""
+        for lane in lanes:
+            validate_data_type(lane.data_type)
+            validate_batch(lane.batch)
+            validate_status(lane.status)
+            if not lane.purpose:
+                raise StoreError("purpose must not be empty")
+            if lane.total_required < 0:
+                raise StoreError("total_required must be >= 0")
+            if lane.assigned_hc < 0:
+                raise StoreError("assigned_hc must be >= 0")
+        seen: set[tuple[str, str, str]] = set()
+        for lane in lanes:
+            key = (lane.data_type, lane.purpose, lane.batch)
+            if key in seen:
+                raise StoreError(f"duplicate lane {lane.data_type}/{lane.purpose}/{lane.batch}")
+            seen.add(key)
+        self._write(
+            "lanes",
+            [
+                {
+                    "data_type": l.data_type,
+                    "purpose": l.purpose,
+                    "batch": l.batch,
+                    "total_required": str(l.total_required),
+                    "assigned_hc": str(l.assigned_hc),
+                    "status": l.status,
+                }
+                for l in lanes
+            ],
+        )
+
     # ----- progress ----------------------------------------------------
 
     def list_progress(self) -> list[ProgressEntry]:
@@ -274,7 +320,7 @@ class Store:
         for row in self._read("progress"):
             out.append(
                 ProgressEntry(
-                    date=parse_date(row["date"]) or date.min,
+                    date=_parse_progress_date(row["date"]),
                     data_type=validate_data_type(row["data_type"]),
                     purpose=row["purpose"].strip(),
                     batch=validate_batch(row["batch"]),
@@ -299,3 +345,51 @@ class Store:
             }
         )
         self._write("progress", rows)
+
+    def merge_progress(self, entries: list[ProgressEntry]) -> tuple[int, int]:
+        """Merge external progress entries; sums items per (date, task).
+
+        Used by sheet sync: entries already present locally (same date and
+        task) are summed in place, new ones appended. Returns
+        (new_entries_added, existing_entries_updated).
+        """
+        existing: dict[tuple[date, str, str, str], int] = {}
+        rows = self._read("progress")
+        for row in rows:
+            d = _parse_progress_date(row["date"])
+            key = (d, row["data_type"].strip(), row["purpose"].strip(),
+                   row["batch"].strip())
+            existing[key] = existing.get(key, 0) + _parse_int(
+                row["items_completed"], "items_completed"
+            )
+        added = 0
+        updated = 0
+        for e in entries:
+            if e.items_completed <= 0:
+                raise StoreError("items_completed must be > 0")
+            key = (e.date, e.data_type, e.purpose, e.batch)
+            if key in existing:
+                existing[key] += e.items_completed
+                updated += 1
+                # update the first matching row in place
+                for row in rows:
+                    rd = _parse_progress_date(row["date"])
+                    rkey = (rd, row["data_type"].strip(), row["purpose"].strip(),
+                            row["batch"].strip())
+                    if rkey == key:
+                        row["items_completed"] = str(existing[key])
+                        break
+            else:
+                existing[key] = e.items_completed
+                rows.append(
+                    {
+                        "date": e.date.isoformat(),
+                        "data_type": e.data_type,
+                        "purpose": e.purpose,
+                        "batch": e.batch,
+                        "items_completed": str(e.items_completed),
+                    }
+                )
+                added += 1
+        self._write("progress", rows)
+        return added, updated

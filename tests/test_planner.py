@@ -1,5 +1,9 @@
+import csv
+import io
+import json
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -301,6 +305,142 @@ class WebTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn("invalid data_type", body)
+
+    def test_sync_page_renders(self):
+        status, body = self._get("/sync")
+        self.assertEqual(status, 200)
+        self.assertIn("Sync with Google Sheets", body)
+        self.assertIn("Pull from Google Sheets now", body)
+
+    def test_sync_set_prefix_via_web(self):
+        status, _ = self._post("/sync/set", {"prefix": "My Planner"})
+        self.assertEqual(status, 303)
+        from planner.sheets import get_sheet_prefix
+
+        self.assertEqual(get_sheet_prefix(self.store), "My Planner")
+
+
+class SheetsSyncTest(unittest.TestCase):
+    """Sync logic tested against a local HTTP server standing in for Drive."""
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        from planner import sheets
+
+        self.tmp = TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "data")
+        self.store.init()
+
+        team_csv = "total_hc,throughput_per_day\r\n5,30\r\n"
+        lanes_csv = (
+            "data_type,purpose,batch,total_required,assigned_hc,status\r\n"
+            "Eval,qc,B1,100,2,in_progress\r\n"
+            "Test,smoke,B1,50,1,not_started\r\n"
+        )
+        progress_csv = (
+            "date,data_type,purpose,batch,items_completed\r\n"
+            "2025-01-06,Eval,qc,B1,40\r\n"
+        )
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith("/drive/files"):
+                    import urllib.parse
+
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(self.path).query
+                    ).get("q", [""])[0]
+                    if "team" in q:
+                        body = json.dumps({"files": [{"id": "team123"}]})
+                    elif "lanes" in q:
+                        body = json.dumps({"files": [{"id": "lanes456"}]})
+                    elif "progress" in q:
+                        body = json.dumps({"files": [{"id": "prog789"}]})
+                    else:
+                        body = json.dumps({"files": []})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+                elif self.path.startswith("/spreadsheets/d/team123"):
+                    self._csv(team_csv)
+                elif self.path.startswith("/spreadsheets/d/lanes456"):
+                    self._csv(lanes_csv)
+                elif self.path.startswith("/spreadsheets/d/prog789"):
+                    self._csv(progress_csv)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def _csv(self, text):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.end_headers()
+                self.wfile.write(text.encode())
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+        # point sheets.py at the local server by pre-seeding exact sheet IDs
+        self._base = f"http://127.0.0.1:{self.port}"
+        self._orig_fetch = sheets._fetch_csv_by_id
+        sheets._fetch_csv_by_id = lambda sheet_id: list(
+            csv.DictReader(io.StringIO(self._http_get(f"{self._base}/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv")))
+        )
+        # seed exact IDs so no Drive search is needed
+        sheets.set_sheet_id(self.store, "team", "team123")
+        sheets.set_sheet_id(self.store, "lanes", "lanes456")
+        sheets.set_sheet_id(self.store, "progress", "prog789")
+
+    def _http_get(self, url):
+        with urllib.request.urlopen(url) as r:
+            return r.read().decode()
+
+    def tearDown(self):
+        from planner import sheets
+
+        sheets._fetch_csv_by_id = self._orig_fetch
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_pull_replaces_team_and_lanes_merges_progress(self):
+        from planner.sheets import pull, set_sheet_prefix
+
+        # pre-existing local progress on the same day must be summed, not lost
+        self.store.log_progress(ProgressEntry(date(2025, 1, 6), "Eval", "qc", "B1", 10))
+
+        set_sheet_prefix(self.store, "TestPlanner")
+        result = pull(self.store)  # IDs seeded in setUp take precedence
+
+        self.assertTrue(result.team_synced)
+        self.assertEqual(result.lanes_replaced, 2)
+        self.assertEqual(result.progress_added, 0)
+        self.assertEqual(result.progress_updated, 1)
+
+        self.assertEqual(self.store.get_team(), Team(5.0, 30.0))
+        lanes = {(l.data_type, l.purpose, l.batch): l for l in self.store.list_lanes()}
+        self.assertEqual(len(lanes), 2)
+        self.assertEqual(lanes[("Eval", "qc", "B1")].total_required, 100)
+
+        entries = self.store.list_progress()
+        total = sum(e.items_completed for e in entries)
+        self.assertEqual(total, 50)  # 10 local + 40 from sheet, merged on same day
+
+    def test_pull_requires_config(self):
+        from planner.sheets import pull
+
+        fresh = Store(Path(self.tmp.name) / "fresh")
+        fresh.init()
+        with self.assertRaises(StoreError):
+            pull(fresh)
 
 
 if __name__ == "__main__":

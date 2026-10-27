@@ -45,6 +45,41 @@ The UI has four pages (links at the top):
 | **Tasks (lanes)** | Add a task (type, purpose, batch, required, assigned HC, status); edit or delete any row inline. |
 | **Log progress** | Log items completed per day per task; see the history. |
 
+## Google Sheets sync
+
+Edit your data in Google Sheets; the tool pulls it in. Create **three
+spreadsheets** in your Drive with these exact title patterns and columns:
+
+| Spreadsheet title | Columns |
+|-------------------|---------|
+| `<prefix> - team` | total_hc, throughput_per_day (one row) |
+| `<prefix> - lanes` | data_type, purpose, batch, total_required, assigned_hc, status |
+| `<prefix> - progress` | date, data_type, purpose, batch, items_completed |
+
+Share each as **Anyone with the link → Viewer** (the tool only reads).
+
+Wire it up (pick one):
+
+```bash
+# Option A: by title prefix (e.g. prefix "Annotation Planner Data")
+python3 -m planner.cli --dir data sheet set "Annotation Planner Data"
+
+# Option B: by exact spreadsheet IDs (the long string in each sheet's URL)
+python3 -m planner.cli --dir data sheet set-id team    <SHEET_ID>
+python3 -m planner.cli --dir data sheet set-id lanes   <SHEET_ID>
+python3 -m planner.cli --dir data sheet set-id progress <SHEET_ID>
+
+# Then pull:
+python3 -m planner.cli --dir data sync
+```
+
+Or use the **Sync (Google Sheets)** page in the web UI — set the prefix/IDs
+and click **Pull from Google Sheets now**.
+
+Merge rules: `team` and `lanes` are **replaced** from the sheets; `progress`
+is **merged** (items summed per date + task), so entries logged through the
+web UI are never lost.
+
 ## Data files
 
 All state lives in plain CSV files inside the data directory — they are the
