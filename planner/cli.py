@@ -1,23 +1,21 @@
 """Command-line interface for the annotation planner.
 
 Usage:
-    python -m planner.cli --dir data <command> [args...]
+    python3 -m planner.cli --dir data <command> [args...]
 
 Commands:
     init                          create the CSV files in --dir
-    operator add ID NAME THROUGHPUT [--inactive]
-    operator list
-    operator set-throughput ID THROUGHPUT
-    operator deactivate ID | operator activate ID
-    requirement set DATA_TYPE PURPOSE BATCH TOTAL
-    requirement list
-    requirement delete DATA_TYPE PURPOSE BATCH
-    allocate set DATA_TYPE PURPOSE BATCH OPERATOR_ID FRACTION [FROM_DATE] [TO_DATE]
-    allocate clear DATA_TYPE PURPOSE BATCH OPERATOR_ID
-    allocate list
-    progress log DATE DATA_TYPE PURPOSE BATCH ITEMS
-    progress summary              completed items by type/purpose/batch
-    plan [--today YYYY-MM-DD] [--horizon DAYS]
+    web [--host H] [--port P]     launch the web UI (default 127.0.0.1:8000)
+    team set HC THROUGHPUT        set total HC and throughput (items/HC/day)
+    team show
+    lane add TYPE PURPOSE BATCH REQUIRED ASSIGNED_HC [STATUS]
+    lane list
+    lane set TYPE PURPOSE BATCH REQUIRED ASSIGNED_HC STATUS
+    lane status TYPE PURPOSE BATCH STATUS   (not_started|in_progress|completed|stopped)
+    lane delete TYPE PURPOSE BATCH
+    progress log DATE TYPE PURPOSE BATCH ITEMS
+    progress summary
+    plan [--today YYYY-MM-DD]
 """
 
 from __future__ import annotations
@@ -27,18 +25,19 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from .planning import build_plan, completion_summary
+from .planning import build_plan
 from .store import (
     DATA_TYPES,
-    Allocation,
-    Operator,
+    STATUSES,
+    Lane,
     ProgressEntry,
-    Requirement,
     Store,
     StoreError,
+    Team,
     parse_date,
     validate_batch,
     validate_data_type,
+    validate_status,
 )
 
 
@@ -64,139 +63,99 @@ def cmd_init(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_operator_add(store: Store, args: argparse.Namespace) -> int:
-    throughput = float(args.throughput)
-    if throughput <= 0:
-        raise StoreError("throughput must be > 0")
-    store.upsert_operator(
-        Operator(
-            operator_id=args.operator_id,
-            name=args.name,
-            throughput_per_day=throughput,
-            active=not args.inactive,
+def cmd_web(store: Store, args: argparse.Namespace) -> int:
+    from .web import run
+
+    run(store, host=args.host, port=args.port)
+    return 0
+
+
+def cmd_team_set(store: Store, args: argparse.Namespace) -> int:
+    store.set_team(
+        Team(
+            total_hc=float(args.total_hc),
+            throughput_per_day=float(args.throughput),
         )
     )
-    print(f"operator {args.operator_id} saved")
-    return 0
-
-
-def cmd_operator_list(store: Store, args: argparse.Namespace) -> int:
-    ops = store.list_operators()
-    _print_table(
-        ["operator_id", "name", "throughput/day", "active", "capacity/day"],
-        [
-            [
-                op.operator_id,
-                op.name,
-                f"{op.throughput_per_day:g}",
-                "yes" if op.active else "no",
-                f"{op.throughput_per_day:g}" if op.active else "0",
-            ]
-            for op in ops
-        ],
+    print(
+        f"team set: {float(args.total_hc):g} HC at "
+        f"{float(args.throughput):g} items/HC/day"
     )
     return 0
 
 
-def cmd_operator_set_throughput(store: Store, args: argparse.Namespace) -> int:
-    op = store.get_operator(args.operator_id)
-    throughput = float(args.throughput)
-    if throughput <= 0:
-        raise StoreError("throughput must be > 0")
-    store.upsert_operator(
-        Operator(op.operator_id, op.name, throughput, op.active)
-    )
-    print(f"operator {args.operator_id} throughput set to {throughput:g}/day")
+def cmd_team_show(store: Store, args: argparse.Namespace) -> int:
+    team = store.get_team()
+    print(f"total HC: {team.total_hc:g}")
+    print(f"throughput: {team.throughput_per_day:g} items/HC/day")
     return 0
 
 
-def cmd_operator_set_active(store: Store, args: argparse.Namespace) -> int:
-    op = store.get_operator(args.operator_id)
-    store.upsert_operator(
-        Operator(op.operator_id, op.name, op.throughput_per_day, args.active)
-    )
-    print(f"operator {args.operator_id} {'activated' if args.active else 'deactivated'}")
-    return 0
-
-
-def cmd_requirement_set(store: Store, args: argparse.Namespace) -> int:
-    data_type = validate_data_type(args.data_type)
-    batch = validate_batch(args.batch)
-    total = int(args.total)
-    store.set_requirement(Requirement(data_type, args.purpose, batch, total))
-    print(f"requirement set: {data_type}/{args.purpose}/{batch} = {total} items")
-    return 0
-
-
-def cmd_requirement_list(store: Store, args: argparse.Namespace) -> int:
-    reqs = store.list_requirements()
-    _print_table(
-        ["data_type", "purpose", "batch", "total_required"],
-        [
-            [r.data_type, r.purpose, r.batch, str(r.total_required)]
-            for r in sorted(reqs, key=lambda r: (r.data_type, r.purpose, r.batch))
-        ],
-    )
-    return 0
-
-
-def cmd_requirement_delete(store: Store, args: argparse.Namespace) -> int:
-    store.delete_requirement(
-        validate_data_type(args.data_type), args.purpose, validate_batch(args.batch)
-    )
-    print("requirement deleted")
-    return 0
-
-
-def cmd_allocate_set(store: Store, args: argparse.Namespace) -> int:
-    fraction = float(args.fraction)
-    from_date = parse_date(args.from_date, "from_date") if args.from_date else None
-    to_date = parse_date(args.to_date, "to_date") if args.to_date else None
-    store.set_allocation(
-        Allocation(
+def cmd_lane_add(store: Store, args: argparse.Namespace) -> int:
+    store.set_lane(
+        Lane(
             data_type=validate_data_type(args.data_type),
             purpose=args.purpose,
             batch=validate_batch(args.batch),
-            operator_id=args.operator_id,
-            hc_fraction=fraction,
-            from_date=from_date,
-            to_date=to_date,
+            total_required=int(args.required),
+            assigned_hc=float(args.assigned_hc),
+            status=validate_status(args.status),
         )
     )
-    print(f"allocation set: {args.operator_id} -> {args.data_type}/{args.purpose}/{args.batch} at {fraction:g} HC")
+    print(f"lane added: {args.data_type}/{args.purpose}/{args.batch}")
     return 0
 
 
-def cmd_allocate_clear(store: Store, args: argparse.Namespace) -> int:
-    store.clear_allocation(
+def cmd_lane_list(store: Store, args: argparse.Namespace) -> int:
+    lanes = store.list_lanes()
+    _print_table(
+        ["data_type", "purpose", "batch", "required", "assigned_hc", "status"],
+        [
+            [
+                l.data_type,
+                l.purpose,
+                l.batch,
+                str(l.total_required),
+                f"{l.assigned_hc:g}",
+                l.status,
+            ]
+            for l in sorted(lanes, key=lambda l: (l.data_type, l.purpose, l.batch))
+        ],
+    )
+    return 0
+
+
+def cmd_lane_set(store: Store, args: argparse.Namespace) -> int:
+    store.set_lane(
+        Lane(
+            data_type=validate_data_type(args.data_type),
+            purpose=args.purpose,
+            batch=validate_batch(args.batch),
+            total_required=int(args.required),
+            assigned_hc=float(args.assigned_hc),
+            status=validate_status(args.status),
+        )
+    )
+    print(f"lane updated: {args.data_type}/{args.purpose}/{args.batch}")
+    return 0
+
+
+def cmd_lane_status(store: Store, args: argparse.Namespace) -> int:
+    store.set_lane_status(
         validate_data_type(args.data_type),
         args.purpose,
         validate_batch(args.batch),
-        args.operator_id,
+        validate_status(args.status),
     )
-    print("allocation cleared")
+    print(f"status set: {args.data_type}/{args.purpose}/{args.batch} = {args.status}")
     return 0
 
 
-def cmd_allocate_list(store: Store, args: argparse.Namespace) -> int:
-    allocs = store.list_allocations()
-    _print_table(
-        ["data_type", "purpose", "batch", "operator_id", "hc_fraction", "from", "to"],
-        [
-            [
-                a.data_type,
-                a.purpose,
-                a.batch,
-                a.operator_id,
-                f"{a.hc_fraction:g}",
-                _fmt_date(a.from_date),
-                _fmt_date(a.to_date),
-            ]
-            for a in sorted(
-                allocs, key=lambda a: (a.data_type, a.purpose, a.batch, a.operator_id)
-            )
-        ],
+def cmd_lane_delete(store: Store, args: argparse.Namespace) -> int:
+    store.delete_lane(
+        validate_data_type(args.data_type), args.purpose, validate_batch(args.batch)
     )
+    print("lane deleted")
     return 0
 
 
@@ -218,22 +177,18 @@ def cmd_progress_log(store: Store, args: argparse.Namespace) -> int:
 
 
 def cmd_progress_summary(store: Store, args: argparse.Namespace) -> int:
-    rows = completion_summary(store)
+    totals: dict[tuple[str, str, str], int] = {}
+    for p in store.list_progress():
+        key = (p.data_type, p.purpose, p.batch)
+        totals[key] = totals.get(key, 0) + p.items_completed
     _print_table(
-        ["data_type", "purpose", "batch", "completed", "first_day", "last_day"],
+        ["data_type", "purpose", "batch", "completed"],
         [
-            [
-                str(r["data_type"]),
-                str(r["purpose"]),
-                str(r["batch"]),
-                str(r["completed"]),
-                str(r["first_day"]),
-                str(r["last_day"]),
-            ]
-            for r in rows
+            [k[0], k[1], k[2], str(v)]
+            for k, v in sorted(totals.items())
         ],
     )
-    if not rows:
+    if not totals:
         print("(no progress logged yet)")
     return 0
 
@@ -242,9 +197,18 @@ def cmd_plan(store: Store, args: argparse.Namespace) -> int:
     today = parse_date(args.today) if args.today else date.today()
     if today is None:
         raise StoreError("invalid --today date")
-    lanes, utilization, warnings = build_plan(store, today, args.horizon)
+    report = build_plan(store, today)
 
     print(f"Plan as of {today.isoformat()}")
+    print(
+        f"Team: {report.team.total_hc:g} HC at "
+        f"{report.team.throughput_per_day:g} items/HC/day"
+    )
+    s = report.snapshot
+    print(
+        f"Snapshot: required={s.total_required} completed={s.total_completed} "
+        f"in_progress(remaining)={s.total_in_progress} ({s.pct_complete:.1f}%)"
+    )
     print()
     _print_table(
         [
@@ -254,38 +218,34 @@ def cmd_plan(store: Store, args: argparse.Namespace) -> int:
             "required",
             "completed",
             "%done",
+            "assigned_hc",
             "capacity/day",
+            "status",
             "start",
             "finish",
         ],
         [
             [
-                b.key.data_type,
-                b.key.purpose,
-                b.key.batch,
-                str(b.total_required),
-                str(b.completed),
-                f"{b.pct_complete:.1f}",
-                f"{b.capacity_per_day:.1f}",
-                _fmt_date(b.start_date),
-                _fmt_date(b.finish_date),
+                lp.lane.data_type,
+                lp.lane.purpose,
+                lp.lane.batch,
+                str(lp.lane.total_required),
+                str(lp.completed),
+                f"{lp.pct_complete:.1f}",
+                f"{lp.lane.assigned_hc:g}",
+                f"{lp.capacity_per_day:.1f}",
+                lp.lane.status,
+                _fmt_date(lp.start_date),
+                _fmt_date(lp.finish_date),
             ]
-            for lane in lanes
-            for b in lane.batches
+            for lp in report.lanes
         ],
     )
-    print()
-    active_ops = [op for op in store.list_operators() if op.active]
-    total_hc = len(active_ops)
-    peak = max((u.allocated_hc for u in utilization), default=0.0)
-    print(f"Active HC: {total_hc} operator(s); peak allocated HC across horizon: {peak:.2f}")
-    if warnings:
+    if report.warnings:
         print()
         print("Warnings:")
-        for w in warnings:
+        for w in report.warnings:
             print(f"  - {w}")
-    else:
-        print("No warnings.")
     return 0
 
 
@@ -300,59 +260,50 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="create the CSV files").set_defaults(func=cmd_init)
 
-    p = sub.add_parser("operator", help="manage operators")
-    op_sub = p.add_subparsers(dest="op_command", required=True)
-    a = op_sub.add_parser("add")
-    a.add_argument("operator_id")
-    a.add_argument("name")
-    a.add_argument("throughput", help="items per annotator per day")
-    a.add_argument("--inactive", action="store_true")
-    a.set_defaults(func=cmd_operator_add)
-    op_sub.add_parser("list").set_defaults(func=cmd_operator_list)
-    s = op_sub.add_parser("set-throughput")
-    s.add_argument("operator_id")
+    w = sub.add_parser("web", help="launch the web UI")
+    w.add_argument("--host", default="127.0.0.1")
+    w.add_argument("--port", type=int, default=8000)
+    w.set_defaults(func=cmd_web)
+
+    p = sub.add_parser("team", help="manage team HC and throughput")
+    team_sub = p.add_subparsers(dest="team_command", required=True)
+    s = team_sub.add_parser("set", help="set total HC and throughput per HC per day")
+    s.add_argument("total_hc")
     s.add_argument("throughput")
-    s.set_defaults(func=cmd_operator_set_throughput)
-    d = op_sub.add_parser("deactivate")
-    d.add_argument("operator_id")
-    d.set_defaults(func=lambda st, ar: cmd_operator_set_active(st, argparse.Namespace(operator_id=ar.operator_id, active=False)))
-    ac = op_sub.add_parser("activate")
-    ac.add_argument("operator_id")
-    ac.set_defaults(func=lambda st, ar: cmd_operator_set_active(st, argparse.Namespace(operator_id=ar.operator_id, active=True)))
+    s.set_defaults(func=cmd_team_set)
+    team_sub.add_parser("show").set_defaults(func=cmd_team_show)
 
-    p = sub.add_parser("requirement", help="manage required labeling volumes")
-    req_sub = p.add_subparsers(dest="req_command", required=True)
-    s = req_sub.add_parser("set", help=f"set required items; data_type in {', '.join(DATA_TYPES)}")
-    s.add_argument("data_type")
-    s.add_argument("purpose")
-    s.add_argument("batch", help="e.g. B1, B2")
-    s.add_argument("total", help="total items required")
-    s.set_defaults(func=cmd_requirement_set)
-    req_sub.add_parser("list").set_defaults(func=cmd_requirement_list)
-    d = req_sub.add_parser("delete")
-    d.add_argument("data_type")
-    d.add_argument("purpose")
-    d.add_argument("batch")
-    d.set_defaults(func=cmd_requirement_delete)
-
-    p = sub.add_parser("allocate", help="manage HC allocation")
-    al_sub = p.add_subparsers(dest="al_command", required=True)
-    s = al_sub.add_parser("set")
+    p = sub.add_parser("lane", help="manage labeling tasks (type/purpose/batch)")
+    lane_sub = p.add_subparsers(dest="lane_command", required=True)
+    a = lane_sub.add_parser("add")
+    a.add_argument("data_type", help=f"one of {', '.join(DATA_TYPES)}")
+    a.add_argument("purpose")
+    a.add_argument("batch", help="e.g. B1, B2")
+    a.add_argument("required", help="total items required")
+    a.add_argument("assigned_hc", help="HC assigned to this task")
+    a.add_argument("status", nargs="?", default="not_started",
+                   help=f"one of {', '.join(STATUSES)}")
+    a.set_defaults(func=cmd_lane_add)
+    lane_sub.add_parser("list").set_defaults(func=cmd_lane_list)
+    s = lane_sub.add_parser("set", help="update a task (same fields as add)")
     s.add_argument("data_type")
     s.add_argument("purpose")
     s.add_argument("batch")
-    s.add_argument("operator_id")
-    s.add_argument("fraction", help="HC fraction in (0, 1]")
-    s.add_argument("from_date", nargs="?", help="YYYY-MM-DD, optional")
-    s.add_argument("to_date", nargs="?", help="YYYY-MM-DD, optional")
-    s.set_defaults(func=cmd_allocate_set)
-    c = al_sub.add_parser("clear")
-    c.add_argument("data_type")
-    c.add_argument("purpose")
-    c.add_argument("batch")
-    c.add_argument("operator_id")
-    c.set_defaults(func=cmd_allocate_clear)
-    al_sub.add_parser("list").set_defaults(func=cmd_allocate_list)
+    s.add_argument("required")
+    s.add_argument("assigned_hc")
+    s.add_argument("status")
+    s.set_defaults(func=cmd_lane_set)
+    st = lane_sub.add_parser("status", help="change only the status of a task")
+    st.add_argument("data_type")
+    st.add_argument("purpose")
+    st.add_argument("batch")
+    st.add_argument("status", help=f"one of {', '.join(STATUSES)}")
+    st.set_defaults(func=cmd_lane_status)
+    d = lane_sub.add_parser("delete")
+    d.add_argument("data_type")
+    d.add_argument("purpose")
+    d.add_argument("batch")
+    d.set_defaults(func=cmd_lane_delete)
 
     p = sub.add_parser("progress", help="log and summarize completed work")
     pg_sub = p.add_subparsers(dest="pg_command", required=True)
@@ -367,7 +318,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     pl = sub.add_parser("plan", help="show the full plan report")
     pl.add_argument("--today", help="planning date, YYYY-MM-DD (default: today)")
-    pl.add_argument("--horizon", type=int, default=365, help="HC utilization horizon in days")
     pl.set_defaults(func=cmd_plan)
 
     return parser

@@ -1,36 +1,36 @@
-"""Planning engine: derived metrics over the CSV store.
+"""Planning engine: derived metrics over the CSV store (team-level model).
 
 Model:
-- Lanes are (data_type, purpose) pairs; different data types run in parallel.
-- Within a lane, batches run sequentially: B(n) starts the day after B(n-1)
-  is scheduled to finish.
-- Capacity for an allocation = hc_fraction * operator throughput_per_day,
-  active only within [from_date, to_date] (open-ended when unset).
-- A batch with no allocations is unscheduled (start/finish = None).
+- The team has a total HC and one throughput (items per HC per day).
+- Each lane (data_type, purpose, batch) has: total_required, assigned_hc,
+  and a status (not_started / in_progress / completed / stopped).
+- Capacity per day for a lane = assigned_hc * throughput_per_day.
+- Lanes with status 'stopped' or 'completed' are not scheduled; other lanes
+  are scheduled sequentially per (data_type, purpose) group, in batch order,
+  starting at the planning date.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from .store import Allocation, Operator, ProgressEntry, Requirement, Store
+from .store import Lane, ProgressEntry, Store, Team
 
 WORKDAY = timedelta(days=1)
 
 
 @dataclass(frozen=True)
-class SliceKey:
+class LaneKey:
     data_type: str
     purpose: str
     batch: str
 
 
 @dataclass
-class BatchPlan:
-    key: SliceKey
-    total_required: int
+class LanePlan:
+    lane: Lane
     completed: int
     capacity_per_day: float
     start_date: date | None
@@ -38,257 +38,146 @@ class BatchPlan:
 
     @property
     def remaining(self) -> int:
-        return self.total_required - self.completed
+        return max(self.lane.total_required - self.completed, 0)
+
+    @property
+    def pct_complete(self) -> float:
+        if self.lane.total_required == 0:
+            return 100.0
+        return 100.0 * self.completed / self.lane.total_required
+
+
+@dataclass
+class Snapshot:
+    total_required: int
+    total_completed: int
+    total_in_progress: int
 
     @property
     def pct_complete(self) -> float:
         if self.total_required == 0:
             return 100.0
-        return 100.0 * self.completed / self.total_required
+        return 100.0 * self.total_completed / self.total_required
 
 
 @dataclass
-class LanePlan:
-    data_type: str
-    purpose: str
-    batches: list[BatchPlan]
-    start_date: date | None
-    finish_date: date | None
+class PlanReport:
+    team: Team
+    lanes: list[LanePlan]
+    snapshot: Snapshot
+    daily: dict[date, dict[LaneKey, int]] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
 
-@dataclass
-class HcUtilization:
-    date: date
-    total_hc: float
-    allocated_hc: float
-    operator_over_allocated: bool = False
-
-    @property
-    def over_allocated(self) -> bool:
-        return (
-            self.allocated_hc > self.total_hc + 1e-9
-            or self.operator_over_allocated
-        )
-
-
-def _capacity_per_day(
-    allocations: list[Allocation], operators: dict[str, Operator], on: date
-) -> float:
-    total = 0.0
-    for alloc in allocations:
-        if alloc.from_date and on < alloc.from_date:
-            continue
-        if alloc.to_date and on > alloc.to_date:
-            continue
-        op = operators.get(alloc.operator_id)
-        if op and op.active:
-            total += alloc.hc_fraction * op.throughput_per_day
-    return total
-
-
-def _required_by_key(reqs: list[Requirement]) -> dict[SliceKey, int]:
-    return {
-        SliceKey(r.data_type, r.purpose, r.batch): r.total_required for r in reqs
-    }
-
-
-def _completed_by_key(progress: list[ProgressEntry]) -> dict[SliceKey, int]:
-    totals: dict[SliceKey, int] = defaultdict(int)
+def _completed_by_key(progress: list[ProgressEntry]) -> dict[LaneKey, int]:
+    totals: dict[LaneKey, int] = defaultdict(int)
     for p in progress:
-        totals[SliceKey(p.data_type, p.purpose, p.batch)] += p.items_completed
+        totals[LaneKey(p.data_type, p.purpose, p.batch)] += p.items_completed
     return dict(totals)
 
 
-def _allocations_by_key(
-    allocations: list[Allocation],
-) -> dict[SliceKey, list[Allocation]]:
-    grouped: dict[SliceKey, list[Allocation]] = defaultdict(list)
-    for a in allocations:
-        grouped[SliceKey(a.data_type, a.purpose, a.batch)].append(a)
-    return dict(grouped)
+def _daily_by_key(
+    progress: list[ProgressEntry],
+) -> dict[date, dict[LaneKey, int]]:
+    daily: dict[date, dict[LaneKey, int]] = defaultdict(lambda: defaultdict(int))
+    for p in progress:
+        key = LaneKey(p.data_type, p.purpose, p.batch)
+        daily[p.date][key] += p.items_completed
+    return {d: dict(v) for d, v in daily.items()}
 
 
 def _batch_number(batch: str) -> int:
     return int(batch[1:])
 
 
-def build_plan(
-    store: Store, today: date, horizon_days: int = 365
-) -> tuple[list[LanePlan], list[HcUtilization], list[str]]:
-    """Compute the full plan plus HC utilization warnings.
-
-    Returns (lanes, utilization, warnings). Batches within a lane are
-    scheduled sequentially starting at `today`; a batch with zero capacity
-    is unscheduled and blocks later batches in the same lane.
-    """
-    operators = {op.operator_id: op for op in store.list_operators()}
-    reqs = store.list_requirements()
-    allocations = store.list_allocations()
+def build_plan(store: Store, today: date, horizon_days: int = 90) -> PlanReport:
+    team = store.get_team()
+    lanes = store.list_lanes()
     progress = store.list_progress()
 
-    required = _required_by_key(reqs)
     completed = _completed_by_key(progress)
-    allocs = _allocations_by_key(allocations)
-
-    lanes: dict[tuple[str, str], list[BatchPlan]] = defaultdict(list)
+    daily = _daily_by_key(progress)
     warnings: list[str] = []
 
-    for data_type, purpose in sorted({(r.data_type, r.purpose) for r in reqs}):
-        batches = sorted(
-            (
-                key.batch
-                for key in required
-                if key.data_type == data_type and key.purpose == purpose
-            ),
-            key=_batch_number,
+    assigned_total = sum(lane.assigned_hc for lane in lanes)
+    if team.total_hc > 0 and assigned_total > team.total_hc + 1e-9:
+        warnings.append(
+            f"assigned HC ({assigned_total:g}) exceeds total HC ({team.total_hc:g})"
         )
-        plans: list[BatchPlan] = []
+
+    lane_plans: list[LanePlan] = []
+    total_required = 0
+    total_completed = 0
+    total_in_progress = 0
+
+    groups: dict[tuple[str, str], list[Lane]] = defaultdict(list)
+    for lane in lanes:
+        groups[(lane.data_type, lane.purpose)].append(lane)
+
+    for (data_type, purpose), group in sorted(groups.items()):
+        group = sorted(group, key=lambda l: _batch_number(l.batch))
         cursor = today
         blocked = False
-        for batch in batches:
-            key = SliceKey(data_type, purpose, batch)
-            capacity = _capacity_per_day(allocs.get(key, []), operators, cursor)
+        for lane in group:
+            key = LaneKey(lane.data_type, lane.purpose, lane.batch)
             done = completed.get(key, 0)
-            total = total_of(required, key)
-            remaining = max(total - done, 0)
-            if remaining <= 0:
-                plans.append(
-                    BatchPlan(
-                        key=key,
-                        total_required=total,
-                        completed=done,
-                        capacity_per_day=capacity,
-                        start_date=None,
-                        finish_date=None,
-                    )
+            capacity = lane.assigned_hc * team.throughput_per_day
+            remaining = max(lane.total_required - done, 0)
+
+            total_required += lane.total_required
+            total_completed += min(done, lane.total_required)
+            if lane.status == "in_progress":
+                total_in_progress += remaining
+
+            if lane.status in ("completed", "stopped") or remaining <= 0:
+                lane_plans.append(
+                    LanePlan(lane, done, capacity, None, None)
                 )
                 continue
+
             if blocked or capacity <= 0:
-                plans.append(
-                    BatchPlan(
-                        key=key,
-                        total_required=total,
-                        completed=done,
-                        capacity_per_day=capacity,
-                        start_date=None,
-                        finish_date=None,
+                lane_plans.append(LanePlan(lane, done, capacity, None, None))
+                if not blocked:
+                    blocked = True
+                    warnings.append(
+                        f"{lane.data_type}/{lane.purpose}/{lane.batch}: "
+                        "no HC assigned; not scheduled"
                     )
-                )
-                blocked = True
-                warnings.append(
-                    f"{data_type}/{purpose}/{batch}: no capacity allocated; "
-                    "batch is unscheduled"
-                )
                 continue
+
             days = -(-remaining // capacity)  # ceil
             finish = cursor + timedelta(days=int(days) - 1)
-            plans.append(
-                BatchPlan(
-                    key=key,
-                    total_required=total,
-                    completed=done,
-                    capacity_per_day=capacity,
-                    start_date=cursor,
-                    finish_date=finish,
-                )
+            lane_plans.append(
+                LanePlan(lane, done, capacity, cursor, finish)
             )
             cursor = finish + WORKDAY
-        lanes[(data_type, purpose)] = plans
 
-    lane_plans = [
-        LanePlan(
-            data_type=dt,
-            purpose=pu,
-            batches=plans,
-            start_date=plans[0].start_date if plans else None,
-            finish_date=plans[-1].finish_date if plans else None,
+    snapshot = Snapshot(total_required, total_completed, total_in_progress)
+    return PlanReport(
+        team=team,
+        lanes=lane_plans,
+        snapshot=snapshot,
+        daily=daily,
+        warnings=warnings,
+    )
+
+
+def plan_dates(report: PlanReport) -> list[date]:
+    """All dates that should appear as columns in the daily grid.
+
+    Union of logged progress dates and scheduled start..finish ranges,
+    limited to the horizon from the earliest scheduled date.
+    """
+    dates: set[date] = set(report.daily.keys())
+    starts = [lp.start_date for lp in report.lanes if lp.start_date]
+    if starts:
+        first = min(starts)
+        last = max(
+            (lp.finish_date for lp in report.lanes if lp.finish_date),
+            default=first,
         )
-        for (dt, pu), plans in sorted(lanes.items())
-    ]
-
-    utilization = _hc_utilization(operators, allocations, today, horizon_days, warnings)
-    return lane_plans, utilization, warnings
-
-
-def total_of(required: dict[SliceKey, int], key: SliceKey) -> int:
-    return required.get(key, 0)
-
-
-def _hc_utilization(
-    operators: dict[str, Operator],
-    allocations: list[Allocation],
-    today: date,
-    horizon_days: int,
-    warnings: list[str],
-) -> list[HcUtilization]:
-    active_ops = [op for op in operators.values() if op.active]
-    total_hc = sum(1.0 for _ in active_ops)
-    if total_hc == 0:
-        return []
-    by_operator: dict[str, list[Allocation]] = defaultdict(list)
-    for a in allocations:
-        by_operator[a.operator_id].append(a)
-    result = []
-    warned_ops: set[str] = set()
-    for i in range(horizon_days):
-        on = today + timedelta(days=i)
-        allocated = 0.0
-        any_op_over = False
-        for op_id, allocs in by_operator.items():
-            frac = sum(
-                a.hc_fraction
-                for a in allocs
-                if (not a.from_date or on >= a.from_date)
-                and (not a.to_date or on <= a.to_date)
-            )
-            allocated += min(frac, 1.0)
-            if frac > 1.0 + 1e-9:
-                any_op_over = True
-                if op_id not in warned_ops:
-                    warned_ops.add(op_id)
-                    warnings.append(
-                        f"operator {op_id} over-allocated ({frac:.2f} HC) starting {on.isoformat()}"
-                    )
-        result.append(
-            HcUtilization(
-                date=on,
-                total_hc=total_hc,
-                allocated_hc=allocated,
-                operator_over_allocated=any_op_over,
-            )
-        )
-    over_days = [u for u in result if u.allocated_hc > u.total_hc + 1e-9]
-    if over_days:
-        warnings.append(
-            f"team HC over-allocated on {len(over_days)} day(s), "
-            f"first on {over_days[0].date.isoformat()} "
-            f"({over_days[0].allocated_hc:.2f} allocated vs {over_days[0].total_hc:.2f} HC)"
-        )
-    return result
-
-
-def completion_summary(
-    store: Store,
-) -> list[dict[str, object]]:
-    """Feature 5: completed items grouped by type/purpose/batch and by day."""
-    progress = store.list_progress()
-    by_slice: dict[SliceKey, int] = defaultdict(int)
-    by_day: dict[tuple[date, SliceKey], int] = defaultdict(int)
-    for p in progress:
-        key = SliceKey(p.data_type, p.purpose, p.batch)
-        by_slice[key] += p.items_completed
-        by_day[(p.date, key)] += p.items_completed
-    rows = []
-    for key in sorted(by_slice, key=lambda k: (k.data_type, k.purpose, k.batch)):
-        days = sorted(d for (d, k) in by_day if k == key)
-        rows.append(
-            {
-                "data_type": key.data_type,
-                "purpose": key.purpose,
-                "batch": key.batch,
-                "completed": by_slice[key],
-                "first_day": days[0].isoformat() if days else "",
-                "last_day": days[-1].isoformat() if days else "",
-            }
-        )
-    return rows
+        day = first
+        while day <= last:
+            dates.add(day)
+            day += WORKDAY
+    return sorted(dates)

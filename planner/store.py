@@ -1,12 +1,11 @@
-"""CSV-backed storage for the annotation planner.
+"""CSV-backed storage for the annotation planner (team-level model).
 
-The directory passed to :class:`Store` holds four CSV files which are the
-source of truth and can also be edited directly in a spreadsheet:
+The directory passed to :class:`Store` holds CSV files which are the source
+of truth and can also be edited directly in a spreadsheet:
 
-- operators.csv     operator_id, name, throughput_per_day, active
-- requirements.csv  data_type, purpose, batch, total_required
-- allocations.csv   data_type, purpose, batch, operator_id, hc_fraction, from_date, to_date
-- progress.csv      date, data_type, purpose, batch, items_completed
+- team.csv        total_hc, throughput_per_day
+- lanes.csv       data_type, purpose, batch, total_required, assigned_hc, status
+- progress.csv    date, data_type, purpose, batch, items_completed
 """
 
 from __future__ import annotations
@@ -18,18 +17,17 @@ from datetime import date
 from pathlib import Path
 
 DATA_TYPES = ("Eval", "FT", "Test")
+STATUSES = ("not_started", "in_progress", "completed", "stopped")
 
 HEADERS = {
-    "operators": ["operator_id", "name", "throughput_per_day", "active"],
-    "requirements": ["data_type", "purpose", "batch", "total_required"],
-    "allocations": [
+    "team": ["total_hc", "throughput_per_day"],
+    "lanes": [
         "data_type",
         "purpose",
         "batch",
-        "operator_id",
-        "hc_fraction",
-        "from_date",
-        "to_date",
+        "total_required",
+        "assigned_hc",
+        "status",
     ],
     "progress": ["date", "data_type", "purpose", "batch", "items_completed"],
 }
@@ -42,30 +40,19 @@ class StoreError(Exception):
 
 
 @dataclass(frozen=True)
-class Operator:
-    operator_id: str
-    name: str
+class Team:
+    total_hc: float
     throughput_per_day: float
-    active: bool
 
 
 @dataclass(frozen=True)
-class Requirement:
+class Lane:
     data_type: str
     purpose: str
     batch: str
     total_required: int
-
-
-@dataclass(frozen=True)
-class Allocation:
-    data_type: str
-    purpose: str
-    batch: str
-    operator_id: str
-    hc_fraction: float
-    from_date: date | None
-    to_date: date | None
+    assigned_hc: float
+    status: str
 
 
 @dataclass(frozen=True)
@@ -90,7 +77,9 @@ def parse_date(value: str, field: str = "date") -> date | None:
 def validate_data_type(value: str) -> str:
     value = value.strip()
     if value not in DATA_TYPES:
-        raise StoreError(f"invalid data_type {value!r}; expected one of {', '.join(DATA_TYPES)}")
+        raise StoreError(
+            f"invalid data_type {value!r}; expected one of {', '.join(DATA_TYPES)}"
+        )
     return value
 
 
@@ -98,6 +87,15 @@ def validate_batch(value: str) -> str:
     value = value.strip()
     if not _BATCH_RE.match(value):
         raise StoreError(f"invalid batch {value!r}; expected format like B1, B2, ...")
+    return value
+
+
+def validate_status(value: str) -> str:
+    value = value.strip()
+    if value not in STATUSES:
+        raise StoreError(
+            f"invalid status {value!r}; expected one of {', '.join(STATUSES)}"
+        )
     return value
 
 
@@ -113,10 +111,6 @@ def _parse_float(value: str, field: str) -> float:
         return float(value.strip())
     except (ValueError, AttributeError):
         raise StoreError(f"invalid {field}: {value!r} (expected a number)")
-
-
-def _parse_bool(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes", "y")
 
 
 class Store:
@@ -149,171 +143,117 @@ class Store:
             writer.writeheader()
             writer.writerows(rows)
 
-    # ----- operators -------------------------------------------------
+    # ----- team ------------------------------------------------------
 
-    def list_operators(self) -> list[Operator]:
-        out = []
-        for row in self._read("operators"):
-            out.append(
-                Operator(
-                    operator_id=row["operator_id"].strip(),
-                    name=row["name"].strip(),
-                    throughput_per_day=_parse_float(
-                        row["throughput_per_day"], "throughput_per_day"
-                    ),
-                    active=_parse_bool(row.get("active", "true")),
-                )
-            )
-        return out
+    def get_team(self) -> Team:
+        rows = self._read("team")
+        if not rows:
+            return Team(total_hc=0.0, throughput_per_day=0.0)
+        row = rows[0]
+        return Team(
+            total_hc=_parse_float(row["total_hc"], "total_hc"),
+            throughput_per_day=_parse_float(
+                row["throughput_per_day"], "throughput_per_day"
+            ),
+        )
 
-    def get_operator(self, operator_id: str) -> Operator:
-        for op in self.list_operators():
-            if op.operator_id == operator_id:
-                return op
-        raise StoreError(f"unknown operator_id {operator_id!r}")
-
-    def upsert_operator(self, op: Operator) -> None:
-        rows = self._read("operators")
-        replaced = False
-        for row in rows:
-            if row["operator_id"].strip() == op.operator_id:
-                row.update(
-                    operator_id=op.operator_id,
-                    name=op.name,
-                    throughput_per_day=str(op.throughput_per_day),
-                    active="true" if op.active else "false",
-                )
-                replaced = True
-        if not replaced:
-            rows.append(
+    def set_team(self, team: Team) -> None:
+        if team.total_hc < 0:
+            raise StoreError("total_hc must be >= 0")
+        if team.throughput_per_day <= 0:
+            raise StoreError("throughput_per_day must be > 0")
+        self._write(
+            "team",
+            [
                 {
-                    "operator_id": op.operator_id,
-                    "name": op.name,
-                    "throughput_per_day": str(op.throughput_per_day),
-                    "active": "true" if op.active else "false",
+                    "total_hc": str(team.total_hc),
+                    "throughput_per_day": str(team.throughput_per_day),
                 }
-            )
-        self._write("operators", rows)
+            ],
+        )
 
-    # ----- requirements ----------------------------------------------
+    # ----- lanes -----------------------------------------------------
 
-    def list_requirements(self) -> list[Requirement]:
+    def list_lanes(self) -> list[Lane]:
         out = []
-        for row in self._read("requirements"):
-            data_type = validate_data_type(row["data_type"])
-            batch = validate_batch(row["batch"])
+        for row in self._read("lanes"):
             out.append(
-                Requirement(
-                    data_type=data_type,
-                    purpose=row["purpose"].strip(),
-                    batch=batch,
-                    total_required=_parse_int(row["total_required"], "total_required"),
-                )
-            )
-        return out
-
-    def set_requirement(self, req: Requirement) -> None:
-        validate_data_type(req.data_type)
-        validate_batch(req.batch)
-        if req.total_required < 0:
-            raise StoreError("total_required must be >= 0")
-        if not req.purpose:
-            raise StoreError("purpose must not be empty")
-        rows = self._read("requirements")
-        key = (req.data_type, req.purpose, req.batch)
-        replaced = False
-        for row in rows:
-            if (
-                row["data_type"].strip(),
-                row["purpose"].strip(),
-                row["batch"].strip(),
-            ) == key:
-                row["total_required"] = str(req.total_required)
-                replaced = True
-        if not replaced:
-            rows.append(
-                {
-                    "data_type": req.data_type,
-                    "purpose": req.purpose,
-                    "batch": req.batch,
-                    "total_required": str(req.total_required),
-                }
-            )
-        self._write("requirements", rows)
-
-    def delete_requirement(self, data_type: str, purpose: str, batch: str) -> None:
-        rows = self._read("requirements")
-        kept = [
-            row
-            for row in rows
-            if not (
-                row["data_type"].strip() == data_type
-                and row["purpose"].strip() == purpose
-                and row["batch"].strip() == batch
-            )
-        ]
-        if len(kept) == len(rows):
-            raise StoreError(f"no requirement for {data_type}/{purpose}/{batch}")
-        self._write("requirements", kept)
-
-    # ----- allocations -----------------------------------------------
-
-    def list_allocations(self) -> list[Allocation]:
-        out = []
-        for row in self._read("allocations"):
-            out.append(
-                Allocation(
+                Lane(
                     data_type=validate_data_type(row["data_type"]),
                     purpose=row["purpose"].strip(),
                     batch=validate_batch(row["batch"]),
-                    operator_id=row["operator_id"].strip(),
-                    hc_fraction=_parse_float(row["hc_fraction"], "hc_fraction"),
-                    from_date=parse_date(row.get("from_date", ""), "from_date"),
-                    to_date=parse_date(row.get("to_date", ""), "to_date"),
+                    total_required=_parse_int(
+                        row["total_required"], "total_required"
+                    ),
+                    assigned_hc=_parse_float(row["assigned_hc"], "assigned_hc"),
+                    status=validate_status(row["status"]),
                 )
             )
         return out
 
-    def set_allocation(self, alloc: Allocation) -> None:
-        if not 0 < alloc.hc_fraction <= 1:
-            raise StoreError("hc_fraction must be in (0, 1]")
-        if alloc.from_date and alloc.to_date and alloc.from_date > alloc.to_date:
-            raise StoreError("from_date must not be after to_date")
-        self.get_operator(alloc.operator_id)
-        rows = self._read("allocations")
-        key = (alloc.data_type, alloc.purpose, alloc.batch, alloc.operator_id)
+    def get_lane(self, data_type: str, purpose: str, batch: str) -> Lane:
+        for lane in self.list_lanes():
+            if (
+                lane.data_type == data_type
+                and lane.purpose == purpose
+                and lane.batch == batch
+            ):
+                return lane
+        raise StoreError(f"no lane for {data_type}/{purpose}/{batch}")
+
+    def set_lane(self, lane: Lane) -> None:
+        validate_data_type(lane.data_type)
+        validate_batch(lane.batch)
+        validate_status(lane.status)
+        if not lane.purpose:
+            raise StoreError("purpose must not be empty")
+        if lane.total_required < 0:
+            raise StoreError("total_required must be >= 0")
+        if lane.assigned_hc < 0:
+            raise StoreError("assigned_hc must be >= 0")
+        rows = self._read("lanes")
+        key = (lane.data_type, lane.purpose, lane.batch)
         replaced = False
         for row in rows:
             if (
                 row["data_type"].strip(),
                 row["purpose"].strip(),
                 row["batch"].strip(),
-                row["operator_id"].strip(),
             ) == key:
                 row.update(
-                    hc_fraction=str(alloc.hc_fraction),
-                    from_date=alloc.from_date.isoformat() if alloc.from_date else "",
-                    to_date=alloc.to_date.isoformat() if alloc.to_date else "",
+                    total_required=str(lane.total_required),
+                    assigned_hc=str(lane.assigned_hc),
+                    status=lane.status,
                 )
                 replaced = True
         if not replaced:
             rows.append(
                 {
-                    "data_type": alloc.data_type,
-                    "purpose": alloc.purpose,
-                    "batch": alloc.batch,
-                    "operator_id": alloc.operator_id,
-                    "hc_fraction": str(alloc.hc_fraction),
-                    "from_date": alloc.from_date.isoformat() if alloc.from_date else "",
-                    "to_date": alloc.to_date.isoformat() if alloc.to_date else "",
+                    "data_type": lane.data_type,
+                    "purpose": lane.purpose,
+                    "batch": lane.batch,
+                    "total_required": str(lane.total_required),
+                    "assigned_hc": str(lane.assigned_hc),
+                    "status": lane.status,
                 }
             )
-        self._write("allocations", rows)
+        self._write("lanes", rows)
 
-    def clear_allocation(
-        self, data_type: str, purpose: str, batch: str, operator_id: str
-    ) -> None:
-        rows = self._read("allocations")
+    def set_lane_status(self, data_type: str, purpose: str, batch: str, status: str) -> None:
+        lane = self.get_lane(data_type, purpose, batch)
+        self.set_lane(
+            Lane(
+                lane.data_type,
+                lane.purpose,
+                lane.batch,
+                lane.total_required,
+                lane.assigned_hc,
+                validate_status(status),
+            )
+        )
+
+    def delete_lane(self, data_type: str, purpose: str, batch: str) -> None:
+        rows = self._read("lanes")
         kept = [
             row
             for row in rows
@@ -321,14 +261,11 @@ class Store:
                 row["data_type"].strip() == data_type
                 and row["purpose"].strip() == purpose
                 and row["batch"].strip() == batch
-                and row["operator_id"].strip() == operator_id
             )
         ]
         if len(kept) == len(rows):
-            raise StoreError(
-                f"no allocation for {data_type}/{purpose}/{batch}/{operator_id}"
-            )
-        self._write("allocations", kept)
+            raise StoreError(f"no lane for {data_type}/{purpose}/{batch}")
+        self._write("lanes", kept)
 
     # ----- progress ----------------------------------------------------
 
