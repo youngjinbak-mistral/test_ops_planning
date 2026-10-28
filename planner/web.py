@@ -1,8 +1,9 @@
-"""Zero-dependency web UI for the annotation planner.
+"""Zero-dependency web UI for the annotation planner, styled with the
+Mistral AI design system (sunset palette, cream surfaces, editorial serif
+display type, sunset stripe footer).
 
 Serves a dashboard (snapshot + breakdown table + daily grid) and edit forms
-for team settings, lanes, and progress. Built on http.server; all state lives
-in the CSV files, so the CLI and the UI stay in sync.
+for team rows, lanes, progress, and the Google Sheet sync.
 
 Run:  python3 -m planner.cli --dir data web --port 8000
 """
@@ -10,7 +11,6 @@ Run:  python3 -m planner.cli --dir data web --port 8000
 from __future__ import annotations
 
 import html
-import re
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -23,43 +23,129 @@ from .store import (
     ProgressEntry,
     Store,
     StoreError,
-    Team,
+    TeamRow,
     parse_date,
 )
+
+# Mistral AI design tokens (from the public mistral.ai design system)
+CSS = """
+:root{
+  --primary:#fa520f; --primary-deep:#cc3a05;
+  --sunshine-300:#ffd06a; --sunshine-500:#ffb83e; --sunshine-700:#ffa110;
+  --sunshine-800:#ff8105; --sunshine-900:#ff8a00; --yellow:#ffd900;
+  --cream:#fff8e0; --cream-soft:#fffaeb; --cream-deeper:#fff0c2;
+  --beige-deep:#e6d5a8;
+  --ink:#1f1f1f; --charcoal:#2c2c2c; --slate:#4a4a4a; --steel:#6a6a6a;
+  --stone:#8a8a8a; --muted:#a8a8a8;
+  --hairline:#e5e5e5; --hairline-soft:#ededed; --hairline-strong:#c7c7c7;
+  --canvas:#ffffff; --surface:#fafafa;
+  --ok:#2e7d32; --warn-bg:#fff3e0; --warn:#b26a00; --err-bg:#fdecea; --err:#c62828;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--canvas);color:var(--ink);
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-size:16px;line-height:1.55;}
+.serif{font-family:"PP Editorial Old","Times New Roman",Georgia,serif;}
+header{background:var(--ink);color:#fff;padding:14px 32px;display:flex;
+  align-items:center;gap:24px;flex-wrap:wrap;}
+header .brand{font-size:20px;font-weight:600;letter-spacing:-.3px;display:flex;align-items:center;gap:10px;}
+header .brand .mark{width:26px;height:26px;border-radius:6px;
+  background:linear-gradient(135deg,var(--yellow) 0%,var(--sunshine-700) 45%,var(--primary) 100%);}
+header nav{display:flex;gap:4px;flex-wrap:wrap;}
+header nav a{color:#fff;text-decoration:none;font-size:14px;font-weight:500;
+  padding:8px 12px;border-radius:8px;transition:background .15s ease;}
+header nav a:hover{background:rgba(255,255,255,.12);}
+header nav a.active{background:var(--primary);}
+main{max-width:1280px;margin:0 auto;padding:32px;}
+h1{font-size:34px;font-weight:500;letter-spacing:-.5px;margin:0 0 4px;}
+h2{font-size:22px;font-weight:500;margin:40px 0 12px;}
+h3{font-size:18px;font-weight:500;margin:24px 0 8px;}
+.sub{color:var(--steel);font-size:14px;margin:0 0 24px;}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--canvas);}
+th,td{border-bottom:1px solid var(--hairline);padding:10px 12px;text-align:left;vertical-align:middle;}
+th{color:var(--steel);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.6px;}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;}
+tbody tr:hover{background:var(--surface);}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin:24px 0;}
+.card{background:var(--cream-soft);border:1px solid var(--beige-deep);border-radius:12px;padding:20px 24px;}
+.card .label{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--slate);}
+.card .big{font-size:40px;font-weight:400;line-height:1.1;margin-top:6px;letter-spacing:-1px;}
+.card .hint{font-size:12px;color:var(--steel);margin-top:4px;}
+.panel{background:var(--canvas);border:1px solid var(--hairline);border-radius:12px;padding:24px;margin:16px 0;}
+.panel.cream{background:var(--cream);border-color:var(--beige-deep);}
+button,.btn{background:var(--primary);color:#fff;border:none;border-radius:8px;
+  padding:10px 20px;font-size:14px;font-weight:500;cursor:pointer;
+  font-family:inherit;transition:background .15s ease;text-decoration:none;display:inline-block;}
+button:hover,.btn:hover{background:var(--primary-deep);}
+button.secondary,.btn.secondary{background:var(--canvas);color:var(--ink);border:1px solid var(--hairline-strong);}
+button.secondary:hover{background:var(--surface);}
+button.danger{background:var(--err);}
+input,select{font-family:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--hairline-strong);
+  border-radius:8px;background:var(--canvas);color:var(--ink);min-width:90px;}
+input:focus,select:focus{outline:2px solid var(--sunshine-500);outline-offset:0;border-color:var(--sunshine-700);}
+input[type=number]{width:110px;}
+input[type=date]{min-width:150px;}
+.flash{background:var(--cream);border:1px solid var(--beige-deep);color:var(--ink);
+  padding:12px 16px;border-radius:8px;margin:16px 0;font-size:14px;}
+.err{background:var(--err-bg);border:1px solid #f5c6c0;color:var(--err);
+  padding:12px 16px;border-radius:8px;margin:16px 0;font-size:14px;}
+.warnbox{background:var(--warn-bg);border:1px solid var(--sunshine-300);border-radius:12px;
+  padding:16px 20px;margin:16px 0;}
+.warnbox h2{color:var(--warn);margin-top:0;}
+.warnbox ul{margin:8px 0 0;padding-left:20px;color:var(--charcoal);font-size:14px;}
+.badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;}
+.badge.not_started{background:var(--hairline-soft);color:var(--slate);}
+.badge.in_progress{background:var(--sunshine-300);color:var(--ink);}
+.badge.completed{background:#dcedc8;color:var(--ok);}
+.badge.stopped{background:var(--err-bg);color:var(--err);}
+.gridwrap{overflow-x:auto;border:1px solid var(--hairline);border-radius:12px;}
+.grid td{min-width:52px;text-align:right;font-variant-numeric:tabular-nums;border-bottom:1px solid var(--hairline-soft);}
+.grid td.rowlabel{min-width:200px;text-align:left;font-weight:500;}
+.grid th{position:sticky;top:0;background:var(--cream);}
+form.inline{display:inline;}
+.rowform td{padding:6px 8px;}
+.muted{color:var(--muted);font-size:13px;}
+code{font-family:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px;
+  background:var(--surface);padding:2px 6px;border-radius:4px;}
+.stripe{height:10px;margin-top:48px;
+  background:linear-gradient(90deg,var(--primary) 0%,var(--sunshine-800) 30%,var(--yellow) 60%,var(--cream) 100%);}
+footer{max-width:1280px;margin:0 auto;padding:24px 32px 40px;color:var(--stone);font-size:13px;}
+.stat-row{display:flex;gap:48px;flex-wrap:wrap;margin:16px 0;}
+.stat .big{font-size:56px;font-weight:400;line-height:1.1;letter-spacing:-1px;}
+.stat .label{font-size:13px;color:var(--steel);text-transform:uppercase;letter-spacing:.8px;font-weight:600;}
+@media(max-width:768px){main{padding:20px;}h1{font-size:26px;}.card .big{font-size:30px;}}
+"""
 
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Annotation Planner</title>
-<style>
- body {{ font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 2rem; color: #1a1a1a; }}
- h1 {{ font-size: 1.4rem; }} h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
- table {{ border-collapse: collapse; margin: 0.5rem 0; font-size: 0.85rem; }}
- th, td {{ border: 1px solid #ccc; padding: 0.3rem 0.5rem; text-align: left; }}
- th {{ background: #f0f0f0; }}
- td.num, th.num {{ text-align: right; }}
- .cards {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
- .card {{ border: 1px solid #ccc; border-radius: 8px; padding: 1rem 1.5rem; min-width: 10rem; }}
- .card .big {{ font-size: 1.6rem; font-weight: 600; }}
- .warn {{ color: #a00; }}
- form.inline {{ display: inline; }}
- input, select {{ font-size: 0.85rem; padding: 0.15rem 0.3rem; }}
- input[type=number] {{ width: 6rem; }}
- .grid td {{ min-width: 3.2rem; text-align: right; }}
- .grid td.rowlabel {{ min-width: 12rem; text-align: left; }}
- nav a {{ margin-right: 1rem; }}
- .flash {{ background: #e6f4e6; border: 1px solid #9c9; padding: 0.5rem 1rem; border-radius: 6px; }}
- .err {{ background: #fbe6e6; border: 1px solid #c99; padding: 0.5rem 1rem; border-radius: 6px; }}
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · Annotation Planner</title>
+<style>{css}</style>
 </head>
 <body>
-<nav><a href="/">Dashboard</a><a href="/team">Team &amp; throughput</a><a href="/lanes">Tasks (lanes)</a><a href="/progress">Log progress</a><a href="/sync">Sync (Google Sheets)</a></nav>
+<header>
+  <div class="brand"><span class="mark"></span>Annotation Planner</div>
+  <nav>{nav}</nav>
+</header>
+<main>
 {flash}
 {body}
+</main>
+<div class="stripe"></div>
+<footer>Annotation Planner · data lives in CSV / Google Sheets · styled with the Mistral AI design system</footer>
 </body>
 </html>
 """
+
+NAV_ITEMS = [
+    ("/", "Dashboard"),
+    ("/team", "Team"),
+    ("/lanes", "Tasks"),
+    ("/progress", "Progress"),
+    ("/sync", "Sync"),
+]
 
 
 def esc(value: object) -> str:
@@ -73,14 +159,15 @@ def _options(values: list[str], selected: str) -> str:
     )
 
 
+def _badge(status: str) -> str:
+    return f'<span class="badge {esc(status)}">{esc(status)}</span>'
+
+
 class PlannerHandler(BaseHTTPRequestHandler):
-    store: Store = None  # set on the server instance
-    server_version = "AnnotationPlanner/1.0"
+    server_version = "AnnotationPlanner/2.0"
 
     def log_message(self, format: str, *args: object) -> None:
         pass
-
-    # ----- helpers ---------------------------------------------------
 
     @property
     def st(self) -> Store:
@@ -94,13 +181,17 @@ class PlannerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _page(self, body: str, flash: str = "", error: str = "") -> None:
+    def _page(self, body: str, title: str, flash: str = "", error: str = "") -> None:
+        nav = "".join(
+            f'<a href="{href}"{" class=\"active\"" if href == urlparse(self.path).path else ""}>{label}</a>'
+            for href, label in NAV_ITEMS
+        )
         flash_html = ""
         if flash:
             flash_html = f'<div class="flash">{esc(flash)}</div>'
         if error:
             flash_html += f'<div class="err">{esc(error)}</div>'
-        self._send(_PAGE.format(flash=flash_html, body=body))
+        self._send(_PAGE.format(title=title, css=CSS, nav=nav, flash=flash_html, body=body))
 
     def _redirect(self, location: str = "/") -> None:
         self.send_response(303)
@@ -113,33 +204,41 @@ class PlannerHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/":
-                self._page(self._dashboard())
+                self._page(self._dashboard(), "Dashboard")
             elif path == "/team":
-                self._page(self._team_form())
+                self._page(self._team_page(), "Team")
             elif path == "/lanes":
-                self._page(self._lanes_page())
+                self._page(self._lanes_page(), "Tasks")
             elif path == "/progress":
-                self._page(self._progress_page())
+                self._page(self._progress_page(), "Progress")
             elif path == "/sync":
-                self._page(self._sync_page())
+                self._page(self._sync_page(), "Sync")
             else:
                 self._send("not found", 404)
         except StoreError as exc:
-            self._page(f"<h1>Error</h1><p>{esc(exc)}</p>", error=str(exc))
+            self._page(f"<h1>Error</h1><p>{esc(exc)}</p>", "Error", error=str(exc))
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         form = parse_qs(self.rfile.read(length).decode("utf-8"))
-        get = lambda k, d="": form.get(k, [d])[0].strip()
+
+        def get(k: str, d: str = "") -> str:
+            return form.get(k, [d])[0].strip()
+
         try:
-            if path == "/team":
-                self.st.set_team(
-                    Team(
+            if path == "/team/add":
+                self.st.add_team_row(
+                    TeamRow(
+                        from_date=parse_date(get("from_date"), "from_date"),
+                        to_date=parse_date(get("to_date"), "to_date"),
                         total_hc=float(get("total_hc", "0")),
                         throughput_per_day=float(get("throughput_per_day", "0")),
                     )
                 )
+                self._redirect("/team")
+            elif path == "/team/clear":
+                self.st.clear_team_rows()
                 self._redirect("/team")
             elif path == "/lanes/add":
                 self.st.set_lane(
@@ -168,27 +267,6 @@ class PlannerHandler(BaseHTTPRequestHandler):
             elif path == "/lanes/delete":
                 self.st.delete_lane(get("data_type"), get("purpose"), get("batch"))
                 self._redirect("/lanes")
-            elif path == "/sync/set":
-                from .sheets import set_sheet_id, set_sheet_prefix
-
-                prefix = get("prefix")
-                if prefix:
-                    set_sheet_prefix(self.st, prefix)
-                for suffix in ("team", "lanes", "progress"):
-                    sid = get(f"id_{suffix}")
-                    if sid:
-                        set_sheet_id(self.st, suffix, sid)
-                self._redirect("/sync")
-            elif path == "/sync/pull":
-                from .sheets import pull
-
-                result = pull(self.st, get("prefix") or None)
-                self._redirect(
-                    f"/sync?ok=1&lanes={result.lanes_replaced}"
-                    f"&added={result.progress_added}"
-                    f"&merged={result.progress_updated}"
-                    f"&team={int(result.team_synced)}"
-                )
             elif path == "/progress/add":
                 day = parse_date(get("date"))
                 if day is None:
@@ -204,192 +282,203 @@ class PlannerHandler(BaseHTTPRequestHandler):
                     )
                 )
                 self._redirect("/progress")
+            elif path == "/sync/set":
+                from .sheets import set_sheet_id
+
+                set_sheet_id(self.st, get("sheet_id"))
+                self._redirect("/sync")
+            elif path == "/sync/pull":
+                from .sheets import pull
+
+                result = pull(self.st, get("sheet_id") or None)
+                self._redirect(
+                    f"/sync?ok=1&rows={result.team_rows}&lanes={result.lanes_replaced}"
+                    f"&added={result.progress_added}&merged={result.progress_updated}"
+                )
             else:
                 self._send("not found", 404)
         except (StoreError, ValueError) as exc:
-            self._page(f"<h1>Could not save</h1><p>{esc(exc)}</p>", error=str(exc))
+            self._page(f"<h1>Could not save</h1><p>{esc(exc)}</p>", "Error", error=str(exc))
 
     # ----- pages -----------------------------------------------------
 
     def _dashboard(self) -> str:
         today = date.today()
         report = build_plan(self.st, today)
-        team = report.team
         snap = report.snapshot
 
         cards = f"""
 <div class="cards">
-  <div class="card"><div>Total required</div><div class="big">{snap.total_required}</div></div>
-  <div class="card"><div>Total completed</div><div class="big">{snap.total_completed}</div></div>
-  <div class="card"><div>In progress (remaining)</div><div class="big">{snap.total_in_progress}</div></div>
-  <div class="card"><div>Overall %</div><div class="big">{snap.pct_complete:.1f}%</div></div>
-  <div class="card"><div>Total HC</div><div class="big">{team.total_hc:g}</div></div>
-  <div class="card"><div>Throughput (items/HC/day)</div><div class="big">{team.throughput_per_day:g}</div></div>
+  <div class="card"><div class="label">Total required</div><div class="big serif">{snap.total_required}</div></div>
+  <div class="card"><div class="label">Completed</div><div class="big serif">{snap.total_completed}</div></div>
+  <div class="card"><div class="label">In progress</div><div class="big serif">{snap.total_in_progress}</div><div class="hint">items remaining on in-progress tasks</div></div>
+  <div class="card"><div class="label">Overall</div><div class="big serif">{snap.pct_complete:.1f}%</div></div>
+  <div class="card"><div class="label">Peak team HC</div><div class="big serif">{report.team.peak_hc:g}</div></div>
+  <div class="card"><div class="label">Throughput</div><div class="big serif">{report.team.peak_throughput:g}</div><div class="hint">items / HC / day</div></div>
 </div>
 """
 
         rows = []
         for lp in report.lanes:
             lane = lp.lane
+            team_hc = ""
+            throughput = ""
+            if lp.start_date is not None:
+                trow = self.st.team_on(lp.start_date)
+                if trow is not None:
+                    team_hc = f"{trow.total_hc:g}"
+                    throughput = f"{trow.throughput_per_day:g}"
             rows.append(
                 "<tr>"
-                f"<td>{esc(lane.data_type)}</td>"
+                f"<td><strong>{esc(lane.data_type)}</strong></td>"
                 f"<td>{esc(lane.purpose)}</td>"
                 f"<td>{esc(lane.batch)}</td>"
                 f'<td class="num">{lane.total_required}</td>'
                 f'<td class="num">{lp.completed}</td>'
                 f'<td class="num">{lp.pct_complete:.1f}%</td>'
+                f'<td class="num">{team_hc or "\u2014"}</td>'
                 f'<td class="num">{lane.assigned_hc:g}</td>'
+                f'<td class="num">{throughput or "\u2014"}</td>'
                 f'<td class="num">{lp.capacity_per_day:.1f}</td>'
-                f"<td>{esc(lane.status)}</td>"
-                f"<td>{lp.start_date.isoformat() if lp.start_date else '-'}</td>"
-                f"<td>{lp.finish_date.isoformat() if lp.finish_date else '-'}</td>"
+                f"<td>{_badge(lane.status)}</td>"
+                f'<td class="num">{lp.start_date.isoformat() if lp.start_date else "—"}</td>'
+                f'<td class="num">{lp.finish_date.isoformat() if lp.finish_date else "—"}</td>'
                 "</tr>"
             )
         table = f"""
+<div class="panel">
 <table>
-<tr><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Required</th>
+<thead><tr><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Required</th>
 <th class="num">Completed</th><th class="num">%</th>
-<th class="num">Assigned HC</th><th class="num">Capacity/day</th>
-<th>Status</th><th>Start</th><th>Finish</th></tr>
-{''.join(rows) if rows else '<tr><td colspan="11">No tasks yet — add them under Tasks (lanes).</td></tr>'}
+<th class="num">Total HC</th><th class="num">Assigned HC</th><th class="num">Throughput</th><th class="num">Capacity/day</th>
+<th>Status</th><th class="num">Start</th><th class="num">Finish</th></tr></thead>
+<tbody>{''.join(rows) if rows else '<tr><td colspan="13" class="muted">No tasks yet — add them on the Tasks page.</td></tr>'}</tbody>
 </table>
+</div>
 """
 
         dates = plan_dates(report)
         grid = ""
         if dates:
+            from .planning import LaneKey
+
             header = "".join(f"<th>{d.isoformat()[5:]}</th>" for d in dates)
             body_rows = []
             for lp in report.lanes:
                 lane = lp.lane
-                key_label = f"{lane.data_type}/{lane.purpose}/{lane.batch}"
+                key_label = f"{lane.data_type} / {lane.purpose} / {lane.batch}"
                 cells = []
                 for d in dates:
-                    val = report.daily.get(d, {})
-                    from .planning import LaneKey
-
-                    n = val.get(LaneKey(lane.data_type, lane.purpose, lane.batch), 0)
-                    cells.append(f'<td class="num">{"" if n == 0 else n}</td>')
+                    n = report.daily.get(d, {}).get(
+                        LaneKey(lane.data_type, lane.purpose, lane.batch), 0
+                    )
+                    cells.append(f'<td>{"" if n == 0 else n}</td>')
                 body_rows.append(
                     f'<tr><td class="rowlabel">{esc(key_label)}</td>{"".join(cells)}</tr>'
                 )
             grid = f"""
-<h2>Daily completions (columns = dates)</h2>
-<table class="grid">
-<tr><th>Lane</th>{header}</tr>
-{''.join(body_rows)}
-</table>
+<h2>Daily completions</h2>
+<p class="sub">One column per date; cells show items completed that day.</p>
+<div class="gridwrap"><table class="grid">
+<thead><tr><th>Lane</th>{header}</tr></thead>
+<tbody>{''.join(body_rows)}</tbody>
+</table></div>
 """
 
         warnings = ""
         if report.warnings:
             items = "".join(f"<li>{esc(w)}</li>" for w in report.warnings)
-            warnings = f'<h2 class="warn">Warnings</h2><ul class="warn">{items}</ul>'
+            warnings = f'<div class="warnbox"><h2>Attention needed</h2><ul>{items}</ul></div>'
 
-        return f"<h1>Dashboard (as of {today.isoformat()})</h1>{cards}<h2>Task breakdown</h2>{table}{grid}{warnings}"
+        return (
+            f'<h1 class="serif">Dashboard</h1>'
+            f'<p class="sub">Snapshot as of {today.isoformat()} · batches run in order within each type/purpose group</p>'
+            f"{cards}<h2>Task breakdown</h2>{table}{grid}{warnings}"
+        )
 
-    def _team_form(self) -> str:
-        team = self.st.get_team()
-        return f"""
-<h1>Team &amp; throughput</h1>
-<form method="post" action="/team">
+    def _team_page(self) -> str:
+        rows = []
+        for r in self.st.list_team_rows():
+            rows.append(
+                "<tr>"
+                f"<td>{_fmt(r.from_date)}</td>"
+                f"<td>{_fmt(r.to_date)}</td>"
+                f'<td class="num">{r.total_hc:g}</td>'
+                f'<td class="num">{r.throughput_per_day:g}</td>'
+                "</tr>"
+            )
+        table = f"""
+<div class="panel">
 <table>
-<tr><th>Total HC (operators)</th><td><input type="number" step="0.5" min="0" name="total_hc" value="{team.total_hc:g}" required></td></tr>
-<tr><th>Throughput (items per HC per day)</th><td><input type="number" step="0.1" min="0.1" name="throughput_per_day" value="{team.throughput_per_day:g}" required></td></tr>
+<thead><tr><th>From</th><th>To</th><th class="num">Total HC</th><th class="num">Throughput (items/HC/day)</th></tr></thead>
+<tbody>{''.join(rows) if rows else '<tr><td colspan="4" class="muted">No rows yet.</td></tr>'}</tbody>
 </table>
-<p><button type="submit">Save</button></p>
+</div>
+"""
+        return f"""
+<h1 class="serif">Team &amp; throughput</h1>
+<p class="sub">Capacity for a task = assigned HC × throughput. Use date ranges when HC or throughput changes over time — rows must not overlap.</p>
+{table}
+<div class="panel cream">
+<h3>Add a team row</h3>
+<form method="post" action="/team/add">
+<table>
+<tr><th>From (optional)</th><td><input type="date" name="from_date"></td>
+    <th>To (optional)</th><td><input type="date" name="to_date"></td></tr>
+<tr><th>Total HC</th><td><input type="number" step="0.5" min="0" name="total_hc" required></td>
+    <th>Throughput</th><td><input type="number" step="0.1" min="0.1" name="throughput_per_day" required></td></tr>
+</table>
+<p><button type="submit">Add row</button>
+&nbsp;<button type="submit" class="secondary" formaction="/team/clear">Clear all rows</button></p>
 </form>
-<p>Capacity for a task = assigned HC &times; throughput. Example: 2 HC &times; 40 = 80 items/day.</p>
+</div>
 """
 
     def _lanes_page(self) -> str:
         rows = []
         for lane in self.st.list_lanes():
             rows.append(
-                "<tr>"
-                f'<td><form class="inline" method="post" action="/lanes/update">'
+                '<tr class="rowform"><form method="post" action="/lanes/update">'
                 f'<input type="hidden" name="data_type" value="{esc(lane.data_type)}">'
                 f'<input type="hidden" name="purpose" value="{esc(lane.purpose)}">'
                 f'<input type="hidden" name="batch" value="{esc(lane.batch)}">'
-                f'{esc(lane.data_type)}</td>'
-                f'<td>{esc(lane.purpose)}</td>'
+                f"<td><strong>{esc(lane.data_type)}</strong></td>"
+                f"<td>{esc(lane.purpose)}</td>"
                 f"<td>{esc(lane.batch)}</td>"
                 f'<td class="num"><input type="number" min="0" name="total_required" value="{lane.total_required}"></td>'
                 f'<td class="num"><input type="number" step="0.5" min="0" name="assigned_hc" value="{lane.assigned_hc:g}"></td>'
                 f'<td><select name="status">{_options(list(STATUSES), lane.status)}</select></td>'
                 f'<td><button type="submit">Save</button> '
-                f'<button type="submit" formaction="/lanes/delete">Delete</button></form></td>'
-                "</tr>"
+                f'<button type="submit" class="danger" formaction="/lanes/delete">Delete</button></td>'
+                "</form></tr>"
             )
         table = f"""
+<div class="panel">
 <table>
-<tr><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Required</th>
-<th class="num">Assigned HC</th><th>Status</th><th></th></tr>
-{''.join(rows)}
-<tr>
-<form method="post" action="/lanes/add">
-<td><select name="data_type">{_options(list(DATA_TYPES), "Eval")}</select></td>
-<td><input name="purpose" placeholder="e.g. qc" required></td>
-<td><input name="batch" placeholder="B1" required></td>
-<td class="num"><input type="number" min="0" name="total_required" value="0"></td>
-<td class="num"><input type="number" step="0.5" min="0" name="assigned_hc" value="0"></td>
-<td><select name="status">{_options(list(STATUSES), "not_started")}</select></td>
-<td><button type="submit">Add task</button></td>
-</form>
-</tr>
+<thead><tr><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Required</th>
+<th class="num">Assigned HC</th><th>Status</th><th></th></tr></thead>
+<tbody>{''.join(rows)}</tbody>
 </table>
+</div>
 """
-        return f"<h1>Tasks (lanes)</h1><p>Each row is one labeling task: a batch broken down by data type and purpose.</p>{table}"
-
-    def _sync_page(self) -> str:
-        from urllib.parse import parse_qs as _pqs
-
-        from .sheets import get_sheet_ids, get_sheet_prefix
-
-        prefix = get_sheet_prefix(self.st) or ""
-        ids = get_sheet_ids(self.st)
-        query = _pqs(urlparse(self.path).query)
-        ok = query.get("ok", [""])[0]
-        banner = ""
-        if ok == "1":
-            banner = (
-                '<div class="flash">Sync complete: '
-                f"team {'updated' if query.get('team', ['0'])[0] == '1' else 'no row'}, "
-                f"{query.get('lanes', ['0'])[0]} lane(s) replaced, "
-                f"{query.get('added', ['0'])[0]} new progress entries, "
-                f"{query.get('merged', ['0'])[0]} merged into existing day(s).</div>"
-            )
         return f"""
-<h1>Sync with Google Sheets</h1>
-{banner}
-<p>Edit your data in Google Sheets, then pull it here. The tool looks for three
-spreadsheets whose titles start with the prefix below:</p>
-<ul>
-<li><code>&lt;prefix&gt; - team</code> &nbsp;(columns: total_hc, throughput_per_day)</li>
-<li><code>&lt;prefix&gt; - lanes</code> &nbsp;(columns: data_type, purpose, batch, total_required, assigned_hc, status)</li>
-<li><code>&lt;prefix&gt; - progress</code> &nbsp;(columns: date, data_type, purpose, batch, items_completed)</li>
-</ul>
-<form method="post" action="/sync/set">
-<p>Sheet title prefix (used to auto-find your sheets):
-<input name="prefix" value="{esc(prefix)}" size="40">
-<button type="submit">Save</button></p>
-<p>Or paste the exact spreadsheet IDs (the long string in each sheet's URL):</p>
+<h1 class="serif">Tasks</h1>
+<p class="sub">Each row is one labeling task: a batch broken down by data type and purpose. Edit any cell and press Save.</p>
+{table}
+<div class="panel cream">
+<h3>Add a task</h3>
+<form method="post" action="/lanes/add">
 <table>
-<tr><th>team</th><td><input name="id_team" value="{esc(ids.get('team', ''))}" size="45"></td></tr>
-<tr><th>lanes</th><td><input name="id_lanes" value="{esc(ids.get('lanes', ''))}" size="45"></td></tr>
-<tr><th>progress</th><td><input name="id_progress" value="{esc(ids.get('progress', ''))}" size="45"></td></tr>
+<tr><th>Type</th><td><select name="data_type">{_options(list(DATA_TYPES), "Eval")}</select></td>
+    <th>Purpose</th><td><input name="purpose" placeholder="e.g. qc" required></td>
+    <th>Batch</th><td><input name="batch" placeholder="B1" required style="width:70px"></td></tr>
+<tr><th>Required</th><td><input type="number" min="0" name="total_required" value="0"></td>
+    <th>Assigned HC</th><td><input type="number" step="0.5" min="0" name="assigned_hc" value="0"></td>
+    <th>Status</th><td><select name="status">{_options(list(STATUSES), "not_started")}</select></td></tr>
 </table>
-<p><button type="submit">Save</button></p>
+<p><button type="submit">Add task</button></p>
 </form>
-<form method="post" action="/sync/pull">
-<input type="hidden" name="prefix" value="{esc(prefix)}">
-<p><button type="submit">Pull from Google Sheets now</button></p>
-</form>
-<p><b>Sharing:</b> each spreadsheet must be shared as
-&ldquo;Anyone with the link&rdquo; &rarr; Viewer. The tool only reads them.</p>
-<p><b>Merge rules:</b> team and lanes are replaced from the sheets; progress is
-merged (items summed per date + task), so entries logged in this UI are kept.</p>
+</div>
 """
 
     def _progress_page(self) -> str:
@@ -407,25 +496,77 @@ merged (items summed per date + task), so entries logged in this UI are kept.</p
                 f'<td class="num">{p.items_completed}</td></tr>'
             )
         log = f"""
+<div class="panel">
 <table>
-<tr><th>Date</th><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Items</th></tr>
-{''.join(entries) if entries else '<tr><td colspan="5">Nothing logged yet.</td></tr>'}
+<thead><tr><th>Date</th><th>Type</th><th>Purpose</th><th>Batch</th><th class="num">Items</th></tr></thead>
+<tbody>{''.join(entries) if entries else '<tr><td colspan="5" class="muted">Nothing logged yet.</td></tr>'}</tbody>
 </table>
+</div>
 """
         return f"""
-<h1>Log completed work</h1>
+<h1 class="serif">Progress</h1>
+<p class="sub">Log items completed each day. These feed the dashboard snapshot and the daily grid.</p>
+<div class="panel cream">
 <form method="post" action="/progress/add">
 <table>
-<tr><th>Date (YYYY-MM-DD)</th><td><input name="date" placeholder="2025-01-08" required></td></tr>
-<tr><th>Task</th><td><select name="lane">{lane_opts}</select></td></tr>
-<tr><th>Items completed</th><td><input type="number" min="1" name="items" value="1" required></td></tr>
+<tr><th>Date</th><td><input type="date" name="date" required></td>
+    <th>Task</th><td><select name="lane">{lane_opts}</select></td>
+    <th>Items completed</th><td><input type="number" min="1" name="items" value="1" required></td></tr>
 </table>
 <p><button type="submit">Log</button></p>
 </form>
-<p>Tip: the date field also accepts pasting a batch from a spreadsheet.</p>
+</div>
 <h2>History</h2>
 {log}
 """
+
+    def _sync_page(self) -> str:
+        from .sheets import get_sheet_id
+
+        sheet_id = get_sheet_id(self.st) or ""
+        query = parse_qs(urlparse(self.path).query)
+        banner = ""
+        if query.get("ok", [""])[0] == "1":
+            banner = (
+                '<div class="flash">Sync complete: '
+                f"{query.get('rows', ['0'])[0]} team row(s), "
+                f"{query.get('lanes', ['0'])[0]} task(s) replaced, "
+                f"{query.get('added', ['0'])[0]} new progress entries, "
+                f"{query.get('merged', ['0'])[0]} merged into existing day(s).</div>"
+            )
+        return f"""
+<h1 class="serif">Sync with Google Sheets</h1>
+<p class="sub">One spreadsheet, three tabs: <code>team</code>, <code>lanes</code>, <code>progress</code>. Edit there, pull here.</p>
+{banner}
+<div class="panel cream">
+<form method="post" action="/sync/set">
+<p><strong>Spreadsheet ID</strong> (the long string in the sheet's URL):</p>
+<p><input name="sheet_id" value="{esc(sheet_id)}" size="50" required>
+&nbsp;<button type="submit">Save</button></p>
+</form>
+<form method="post" action="/sync/pull">
+<input type="hidden" name="sheet_id" value="{esc(sheet_id)}">
+<p><button type="submit">Pull from Google Sheets now</button></p>
+</form>
+</div>
+<div class="panel">
+<h3>Tab layout</h3>
+<table>
+<thead><tr><th>Tab</th><th>Columns</th></tr></thead>
+<tbody>
+<tr><td><code>team</code></td><td><code>from_date, to_date, total_hc, throughput_per_day</code> — date-ranged; leave dates empty for open-ended</td></tr>
+<tr><td><code>lanes</code></td><td><code>data_type, purpose, batch, total_required, assigned_hc, status</code></td></tr>
+<tr><td><code>progress</code></td><td><code>date, data_type, purpose, batch, items_completed</code></td></tr>
+</tbody>
+</table>
+<p class="muted">Share the spreadsheet as &ldquo;Anyone with the link → Viewer&rdquo;. The tool only reads it.
+Team and tasks are replaced from the sheet; progress is merged (items summed per date + task), so entries logged here are kept.</p>
+</div>
+"""
+
+
+def _fmt(d: date | None) -> str:
+    return d.isoformat() if d else "—"
 
 
 def _split_lane_field(value: str) -> tuple[str, str, str]:
@@ -436,6 +577,7 @@ def _split_lane_field(value: str) -> tuple[str, str, str]:
 
 
 def make_server(store: Store, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
+    store.init()  # make sure the CSV files exist before serving
     server = ThreadingHTTPServer((host, port), PlannerHandler)
     server.store = store  # type: ignore[attr-defined]
     return server

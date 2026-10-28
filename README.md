@@ -3,6 +3,7 @@
 A spreadsheet-backed tool to plan, execute, and amend data labeling
 (annotation) work — with a **web dashboard** for non-technical users.
 Python 3 standard library only — no dependencies, no install step.
+Styled with Mistral brand assets.
 
 ## Concepts
 
@@ -14,69 +15,90 @@ Python 3 standard library only — no dependencies, no install step.
   with: required items, assigned HC, and a status.
 - **Status**: `not_started`, `in_progress`, `completed`, `stopped`.
   Completed/stopped tasks are excluded from scheduling.
-- **Team**: total HC (operators) and one throughput (items per HC per day).
-  **Capacity/day for a task = assigned HC x throughput.**
+- **Team rows**: the team's total HC and throughput (items per HC per day)
+  are set **per date range**, so HC and throughput can change over time
+  (e.g. 4 operators at 40 items/HC/day in January, 2 operators at 55 from
+  February on). Rows must not overlap; leave a date empty for an open-ended
+  period. **Capacity/day for a task = assigned HC x throughput on that day.**
 
-## Launch the web UI
+## Deploy (no terminal needed after this)
+
+### Option A — Render (free, recommended)
+
+1. Push this repository to your own GitHub account.
+2. Go to https://dashboard.render.com → **New +** → **Blueprint**.
+3. Connect the repository; Render reads `render.yaml` automatically.
+4. Click **Apply**. Render builds the Docker image and gives you a public URL
+   like `https://annotation-planner.onrender.com`.
+5. Open the URL — the dashboard is live. Data is stored on Render's disk
+   (`/app/data`, 1 GB on the free tier; it persists across restarts but is
+   wiped if you delete the service).
+
+### Option B — Docker (any server / your own machine)
 
 ```bash
-# 1. get the code (from GitHub: click Code -> Download ZIP, or:)
-git clone https://github.com/youngjinbak-mistral/test_ops_planning.git
-cd test_ops_planning
-
-# 2. create the data folder
-python3 -m planner.cli --dir data init
-
-# 3. set your team: total HC and throughput (items per HC per day)
-python3 -m planner.cli --dir data team set 4 40
-
-# 4. start the UI
-python3 -m planner.cli --dir data web --port 8000
+docker build -t annotation-planner .
+docker run -p 8000:8000 -v planner-data:/app/data annotation-planner
 ```
 
-Open **http://127.0.0.1:8000** in a browser. Press `Ctrl+C` in the terminal to stop.
+Open http://localhost:8000 (or the server's address).
 
-The UI has four pages (links at the top):
+### Option C — Run locally (one command)
+
+- macOS/Linux: `./run.sh`
+- Windows: double-click `run.bat`
+
+Then open http://127.0.0.1:8000.
+
+### Option D — Any Python 3 host
+
+```bash
+python3 -m planner.cli web --port 8000
+```
+
+## Use it
+
+Open the URL. The UI has five pages (links at the top):
 
 | Page | What you can do |
 |------|-----------------|
-| **Dashboard** | Snapshot cards (total required / completed / in progress / overall %), the task breakdown table (one row per type/purpose/batch with required, completed, %, assigned HC, capacity/day, status, planned start/finish), and a daily grid with one column per date showing items completed that day. Warnings appear when assigned HC exceeds total HC or a task has no HC. |
-| **Team & throughput** | Edit total HC and throughput. |
-| **Tasks (lanes)** | Add a task (type, purpose, batch, required, assigned HC, status); edit or delete any row inline. |
-| **Log progress** | Log items completed per day per task; see the history. |
+| **Dashboard** | Snapshot cards (total required / completed / in progress / overall %, peak team HC, throughput), the task breakdown table (one row per type/purpose/batch with required, completed, %, **Total HC**, **Assigned HC**, **Throughput**, capacity/day, status, planned start/finish), and a daily grid with one column per date showing items completed that day. Warnings appear when assigned HC exceeds the team's HC or a task has no capacity. |
+| **Team** | Add date-ranged team rows (from/to dates, total HC, throughput). Overlapping rows are rejected with an explanation. Clear all rows if you need to re-enter them. |
+| **Tasks** | Add a task (type, purpose, batch, required, assigned HC, status); edit or delete any row inline. |
+| **Progress** | Log items completed per day per task; see the history. |
+| **Sync** | Connect one Google Sheet and pull it in. |
 
-## Google Sheets sync
+## Google Sheets sync — ONE spreadsheet
 
-Edit your data in Google Sheets; the tool pulls it in. Create **three
-spreadsheets** in your Drive with these exact title patterns and columns:
+Edit your data in a single Google Sheet; the tool pulls it in. Create **one
+spreadsheet** in your Drive with **three tabs** named exactly `team`, `lanes`,
+and `progress`, with these columns:
 
-| Spreadsheet title | Columns |
-|-------------------|---------|
-| `<prefix> - team` | total_hc, throughput_per_day (one row) |
-| `<prefix> - lanes` | data_type, purpose, batch, total_required, assigned_hc, status |
-| `<prefix> - progress` | date, data_type, purpose, batch, items_completed |
+| Tab | Columns |
+|-----|---------|
+| `team` | from_date, to_date, total_hc, throughput_per_day |
+| `lanes` | data_type, purpose, batch, total_required, assigned_hc, status |
+| `progress` | date, data_type, purpose, batch, items_completed |
 
-Share each as **Anyone with the link → Viewer** (the tool only reads).
+Share the spreadsheet as **Anyone with the link → Viewer** (the tool only
+reads; it never writes). See `SHEET_TEMPLATE.md` for ready-to-paste headers
+and examples.
 
 Wire it up (pick one):
 
 ```bash
-# Option A: by title prefix (e.g. prefix "Annotation Planner Data")
-python3 -m planner.cli --dir data sheet set "Annotation Planner Data"
-
-# Option B: by exact spreadsheet IDs (the long string in each sheet's URL)
-python3 -m planner.cli --dir data sheet set-id team    <SHEET_ID>
-python3 -m planner.cli --dir data sheet set-id lanes   <SHEET_ID>
-python3 -m planner.cli --dir data sheet set-id progress <SHEET_ID>
-
-# Then pull:
-python3 -m planner.cli --dir data sync
+python3 -m planner.cli sheet set <SHEET_ID>
+python3 -m planner.cli sync
 ```
 
-Or use the **Sync (Google Sheets)** page in the web UI — set the prefix/IDs
-and click **Pull from Google Sheets now**.
+Or set the environment variable `ANNOTATION_SHEET_ID=<SHEET_ID>`, or use the
+**Sync** page in the web UI — paste the ID, click **Save**, then
+**Pull from sheet**.
 
-Merge rules: `team` and `lanes` are **replaced** from the sheets; `progress`
+The sheet ID is the long string in the sheet's URL:
+`https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit`
+
+Merge rules: `team` and `lanes` are **replaced** from the sheet; `progress`
 is **merged** (items summed per date + task), so entries logged through the
 web UI are never lost.
 
@@ -88,29 +110,40 @@ source of truth and can be edited directly in Excel/LibreOffice/Google Sheets
 
 | File | Columns |
 |------|---------|
-| `team.csv` | total_hc, throughput_per_day (single row) |
+| `team.csv` | from_date, to_date, total_hc, throughput_per_day |
 | `lanes.csv` | data_type, purpose, batch, total_required, assigned_hc, status |
 | `progress.csv` | date, data_type, purpose, batch, items_completed |
+
+Configuration:
+
+- `PLANNER_DATA_DIR` — where the CSVs live (default `./data`)
+- `PLANNER_HOST` / `PLANNER_PORT` — web UI bind address (default `127.0.0.1:8000`)
+- `ANNOTATION_SHEET_ID` — default Google Sheet for sync
 
 ## CLI (same data, for scripting)
 
 ```bash
-python3 -m planner.cli --dir data init
-python3 -m planner.cli --dir data team set 4 40
-python3 -m planner.cli --dir data team show
-python3 -m planner.cli --dir data lane add Eval qc B1 200 2 in_progress
-python3 -m planner.cli --dir data lane list
-python3 -m planner.cli --dir data lane set Eval qc B1 250 2 in_progress
-python3 -m planner.cli --dir data lane status Eval qc B1 stopped
-python3 -m planner.cli --dir data lane delete Eval qc B1
-python3 -m planner.cli --dir data progress log 2025-01-08 Eval qc B1 35
-python3 -m planner.cli --dir data progress summary
-python3 -m planner.cli --dir data plan [--today 2025-01-08]
-python3 -m planner.cli --dir data web --port 8000
+python3 -m planner.cli init
+python3 -m planner.cli team add 2025-01-01 2025-01-31 4 40   # bounded period
+python3 -m planner.cli team add 2025-02-01 "" 2 55           # open-ended (quote empty)
+python3 -m planner.cli team list
+python3 -m planner.cli team clear
+python3 -m planner.cli lane add Eval qc B1 200 2 in_progress
+python3 -m planner.cli lane list
+python3 -m planner.cli lane set Eval qc B1 250 2 in_progress
+python3 -m planner.cli lane status Eval qc B1 stopped
+python3 -m planner.cli lane delete Eval qc B1
+python3 -m planner.cli progress log 2025-01-08 Eval qc B1 35
+python3 -m planner.cli progress summary
+python3 -m planner.cli plan [--today 2025-01-08]
+python3 -m planner.cli sheet set <SHEET_ID>
+python3 -m planner.cli sheet show
+python3 -m planner.cli sync
+python3 -m planner.cli web --port 8000
 ```
 
-`plan` prints the same numbers as the dashboard: team, snapshot, per-task
-breakdown with capacity and schedule, and warnings.
+`plan` prints the same numbers as the dashboard: team rows, snapshot,
+per-task breakdown with capacity and schedule, and warnings.
 
 ## Scheduling rules
 
@@ -118,7 +151,8 @@ breakdown with capacity and schedule, and warnings.
   day after `B1` is scheduled to finish.
 - A task is scheduled only if its status is `not_started` or `in_progress`,
   it has remaining work, and it has assigned HC > 0.
-- Finish date = start + ceil(remaining / capacity) - 1 days.
+- Capacity is recomputed day by day from the team row covering that day, so a
+  task pauses on days with no team row and resumes when the team returns.
 - The dashboard's daily grid columns cover all logged dates plus the full
   scheduled date range.
 
@@ -127,3 +161,5 @@ breakdown with capacity and schedule, and warnings.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+CI runs the same suite on every push via `.github/workflows/tests.yml`.

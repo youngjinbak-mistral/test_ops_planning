@@ -1,0 +1,22 @@
+# Deploy to Render (https://render.com): New -> Blueprint, point at this repo.
+# Free tier is enough. Set ANNOTATION_SHEET_ID in the environment after deploy.
+services:
+  - type: web
+    name: annotation-planner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -m planner.cli web
+    envVars:
+      - key: PLANNER_HOST
+        value: 0.0.0.0
+      - key: PLANNER_PORT
+        value: "8000"
+      - key: PLANNER_DATA_DIR
+        value: /app/data
+      # - key: ANNOTATION_SHEET_ID
+      #   value: <your-google-sheet-id>
+    disk:
+      name: planner-data
+      mountPath: /app/data
+      sizeGB: 1

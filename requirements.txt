@@ -1,0 +1,2 @@
+# The annotation planner is standard-library only; this file exists so
+# platforms that require it (e.g. Render) have something to install.

@@ -5,13 +5,13 @@ Usage:
 
 Commands:
     init                          create the CSV files in --dir
-    sheet set PREFIX              link Google Sheets by title ('<PREFIX> - team/lanes/progress')
-    sheet set-id TAB SHEET_ID     link one spreadsheet by its exact ID (team|lanes|progress)
-    sheet show
-    sync [--prefix PREFIX]        pull data from the linked Google Sheets
     web [--host H] [--port P]     launch the web UI (default 127.0.0.1:8000)
-    team set HC THROUGHPUT        set total HC and throughput (items/HC/day)
-    team show
+    team add [FROM] [TO] HC THROUGHPUT   add a date-ranged team row (dates optional)
+    team list
+    team clear
+    sheet set SHEET_ID            link the Google Sheet (one spreadsheet, tabs: team/lanes/progress)
+    sheet show
+    sync [--sheet ID]             pull data from the linked Google Sheet
     lane add TYPE PURPOSE BATCH REQUIRED ASSIGNED_HC [STATUS]
     lane list
     lane set TYPE PURPOSE BATCH REQUIRED ASSIGNED_HC STATUS
@@ -25,6 +25,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -37,7 +38,7 @@ from .store import (
     ProgressEntry,
     Store,
     StoreError,
-    Team,
+    TeamRow,
     parse_date,
     validate_batch,
     validate_data_type,
@@ -46,7 +47,7 @@ from .store import (
 
 
 def _fmt_date(d: date | None) -> str:
-    return d.isoformat() if d else "-"
+    return d.isoformat() if d else "..."
 
 
 def _print_table(headers: list[str], rows: list[list[str]]) -> None:
@@ -67,48 +68,6 @@ def cmd_init(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_sheet_set(store: Store, args: argparse.Namespace) -> int:
-    from .sheets import set_sheet_prefix
-
-    set_sheet_prefix(store, args.prefix)
-    print(f"sheet prefix set: {args.prefix!r}")
-    print("Expected sheet titles: '<prefix> - team', '<prefix> - lanes', '<prefix> - progress'")
-    return 0
-
-
-def cmd_sheet_set_id(store: Store, args: argparse.Namespace) -> int:
-    from .sheets import set_sheet_id
-
-    set_sheet_id(store, args.suffix, args.sheet_id)
-    print(f"sheet id for '{args.suffix}' set: {args.sheet_id}")
-    return 0
-
-
-def cmd_sheet_show(store: Store, args: argparse.Namespace) -> int:
-    from .sheets import get_sheet_ids, get_sheet_prefix
-
-    prefix = get_sheet_prefix(store)
-    ids = get_sheet_ids(store)
-    print(f"sheet prefix: {prefix or '(not configured)'}")
-    for suffix in ("team", "lanes", "progress"):
-        print(f"sheet id [{suffix}]: {ids.get(suffix, '(not set)')}")
-    return 0
-
-
-def cmd_sync(store: Store, args: argparse.Namespace) -> int:
-    from .sheets import pull
-
-    result = pull(store, args.prefix)
-    print(f"synced from sheets (prefix {result.source!r}):")
-    print(f"  team: {'updated' if result.team_synced else 'no row found'}")
-    print(f"  lanes: {result.lanes_replaced} replaced")
-    print(
-        f"  progress: {result.progress_added} new, "
-        f"{result.progress_updated} merged into existing day(s)"
-    )
-    return 0
-
-
 def cmd_web(store: Store, args: argparse.Namespace) -> int:
     from .web import run
 
@@ -116,24 +75,76 @@ def cmd_web(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_team_set(store: Store, args: argparse.Namespace) -> int:
-    store.set_team(
-        Team(
+def cmd_team_add(store: Store, args: argparse.Namespace) -> int:
+    from_date = parse_date(args.from_date, "from_date") if args.from_date else None
+    to_date = parse_date(args.to_date, "to_date") if args.to_date else None
+    store.add_team_row(
+        TeamRow(
+            from_date=from_date,
+            to_date=to_date,
             total_hc=float(args.total_hc),
             throughput_per_day=float(args.throughput),
         )
     )
     print(
-        f"team set: {float(args.total_hc):g} HC at "
-        f"{float(args.throughput):g} items/HC/day"
+        f"team row added: {_fmt_date(from_date)}..{_fmt_date(to_date)} "
+        f"at {float(args.total_hc):g} HC, {float(args.throughput):g} items/HC/day"
     )
     return 0
 
 
-def cmd_team_show(store: Store, args: argparse.Namespace) -> int:
-    team = store.get_team()
-    print(f"total HC: {team.total_hc:g}")
-    print(f"throughput: {team.throughput_per_day:g} items/HC/day")
+def cmd_team_list(store: Store, args: argparse.Namespace) -> int:
+    rows = store.list_team_rows()
+    _print_table(
+        ["from_date", "to_date", "total_hc", "throughput/day"],
+        [
+            [
+                _fmt_date(r.from_date),
+                _fmt_date(r.to_date),
+                f"{r.total_hc:g}",
+                f"{r.throughput_per_day:g}",
+            ]
+            for r in rows
+        ],
+    )
+    if not rows:
+        print("(no team rows; add one with 'team add')")
+    return 0
+
+
+def cmd_team_clear(store: Store, args: argparse.Namespace) -> int:
+    store.clear_team_rows()
+    print("team rows cleared")
+    return 0
+
+
+def cmd_sheet_set(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import set_sheet_id
+
+    set_sheet_id(store, args.sheet_id)
+    print(f"Google Sheet linked: {args.sheet_id}")
+    print("Expected tabs: team, lanes, progress (share as 'Anyone with the link, Viewer')")
+    return 0
+
+
+def cmd_sheet_show(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import get_sheet_id
+
+    print(f"sheet id: {get_sheet_id(store) or '(not configured)'}")
+    return 0
+
+
+def cmd_sync(store: Store, args: argparse.Namespace) -> int:
+    from .sheets import pull
+
+    result = pull(store, args.sheet_id)
+    print(f"synced from sheet {result.sheet_id}:")
+    print(f"  team: {result.team_rows} row(s) replaced")
+    print(f"  lanes: {result.lanes_replaced} replaced")
+    print(
+        f"  progress: {result.progress_added} new, "
+        f"{result.progress_updated} merged into existing day(s)"
+    )
     return 0
 
 
@@ -229,10 +240,7 @@ def cmd_progress_summary(store: Store, args: argparse.Namespace) -> int:
         totals[key] = totals.get(key, 0) + p.items_completed
     _print_table(
         ["data_type", "purpose", "batch", "completed"],
-        [
-            [k[0], k[1], k[2], str(v)]
-            for k, v in sorted(totals.items())
-        ],
+        [[k[0], k[1], k[2], str(v)] for k, v in sorted(totals.items())],
     )
     if not totals:
         print("(no progress logged yet)")
@@ -246,11 +254,21 @@ def cmd_plan(store: Store, args: argparse.Namespace) -> int:
     report = build_plan(store, today)
 
     print(f"Plan as of {today.isoformat()}")
-    print(
-        f"Team: {report.team.total_hc:g} HC at "
-        f"{report.team.throughput_per_day:g} items/HC/day"
+    print("Team rows (HC / throughput per day):")
+    _print_table(
+        ["from_date", "to_date", "total_hc", "throughput/day"],
+        [
+            [
+                _fmt_date(r.from_date),
+                _fmt_date(r.to_date),
+                f"{r.total_hc:g}",
+                f"{r.throughput_per_day:g}",
+            ]
+            for r in report.team.rows
+        ],
     )
     s = report.snapshot
+    print()
     print(
         f"Snapshot: required={s.total_required} completed={s.total_completed} "
         f"in_progress(remaining)={s.total_in_progress} ({s.pct_complete:.1f}%)"
@@ -299,40 +317,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="annotation-planner")
     parser.add_argument(
         "--dir",
-        default="data",
-        help="directory holding the CSV files (default: ./data)",
+        default=os.environ.get("PLANNER_DATA_DIR", "data"),
+        help="directory holding the CSV files (default: ./data, or PLANNER_DATA_DIR)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the CSV files").set_defaults(func=cmd_init)
 
-    p = sub.add_parser("sheet", help="configure the Google Sheets source")
-    sheet_sub = p.add_subparsers(dest="sheet_command", required=True)
-    s = sheet_sub.add_parser("set", help="set the sheet title prefix, e.g. 'Annotation Planner Data'")
-    s.add_argument("prefix")
-    s.set_defaults(func=cmd_sheet_set)
-    si = sheet_sub.add_parser("set-id", help="set the exact spreadsheet ID for one table (team|lanes|progress)")
-    si.add_argument("suffix", help="team, lanes, or progress")
-    si.add_argument("sheet_id", help="the long ID from the spreadsheet URL")
-    si.set_defaults(func=cmd_sheet_set_id)
-    sheet_sub.add_parser("show").set_defaults(func=cmd_sheet_show)
-
-    sy = sub.add_parser("sync", help="pull data from the linked Google Sheets")
-    sy.add_argument("--prefix", help="override the configured sheet title prefix")
-    sy.set_defaults(func=cmd_sync)
-
     w = sub.add_parser("web", help="launch the web UI")
-    w.add_argument("--host", default="127.0.0.1")
-    w.add_argument("--port", type=int, default=8000)
+    w.add_argument("--host", default=os.environ.get("PLANNER_HOST", "127.0.0.1"))
+    w.add_argument(
+        "--port", type=int, default=int(os.environ.get("PLANNER_PORT", "8000"))
+    )
     w.set_defaults(func=cmd_web)
 
-    p = sub.add_parser("team", help="manage team HC and throughput")
+    p = sub.add_parser("team", help="manage date-ranged team HC and throughput")
     team_sub = p.add_subparsers(dest="team_command", required=True)
-    s = team_sub.add_parser("set", help="set total HC and throughput per HC per day")
-    s.add_argument("total_hc")
-    s.add_argument("throughput")
-    s.set_defaults(func=cmd_team_set)
-    team_sub.add_parser("show").set_defaults(func=cmd_team_show)
+    a = team_sub.add_parser("add", help="add a row: team add [FROM] [TO] HC THROUGHPUT")
+    a.add_argument("from_date", nargs="?", help="YYYY-MM-DD, optional (open start)")
+    a.add_argument("to_date", nargs="?", help="YYYY-MM-DD, optional (open end)")
+    a.add_argument("total_hc")
+    a.add_argument("throughput", help="items per HC per day")
+    a.set_defaults(func=cmd_team_add)
+    team_sub.add_parser("list").set_defaults(func=cmd_team_list)
+    team_sub.add_parser("clear").set_defaults(func=cmd_team_clear)
+
+    p = sub.add_parser("sheet", help="link the Google Sheet")
+    sh_sub = p.add_subparsers(dest="sheet_command", required=True)
+    s = sh_sub.add_parser("set", help="set the spreadsheet ID (long string in the sheet URL)")
+    s.add_argument("sheet_id")
+    s.set_defaults(func=cmd_sheet_set)
+    sh_sub.add_parser("show").set_defaults(func=cmd_sheet_show)
+
+    sy = sub.add_parser("sync", help="pull data from the linked Google Sheet")
+    sy.add_argument("--sheet-id", help="override the configured spreadsheet ID")
+    sy.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("lane", help="manage labeling tasks (type/purpose/batch)")
     lane_sub = p.add_subparsers(dest="lane_command", required=True)
@@ -387,6 +406,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = Store(Path(args.dir))
+    if args.func is not cmd_init:
+        store.init()  # auto-create the CSV files so every command just works
     try:
         return args.func(store, args)
     except StoreError as exc:

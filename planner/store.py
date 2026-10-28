@@ -3,9 +3,11 @@
 The directory passed to :class:`Store` holds CSV files which are the source
 of truth and can also be edited directly in a spreadsheet:
 
-- team.csv        total_hc, throughput_per_day
-- lanes.csv       data_type, purpose, batch, total_required, assigned_hc, status
-- progress.csv    date, data_type, purpose, batch, items_completed
+- team.csv      from_date, to_date, total_hc, throughput_per_day
+                (date-ranged rows; empty dates = open-ended; rows must
+                not overlap, so HC and throughput can differ per day)
+- lanes.csv     data_type, purpose, batch, total_required, assigned_hc, status
+- progress.csv  date, data_type, purpose, batch, items_completed
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ DATA_TYPES = ("Eval", "FT", "Test")
 STATUSES = ("not_started", "in_progress", "completed", "stopped")
 
 HEADERS = {
-    "team": ["total_hc", "throughput_per_day"],
+    "team": ["from_date", "to_date", "total_hc", "throughput_per_day"],
     "lanes": [
         "data_type",
         "purpose",
@@ -40,7 +42,9 @@ class StoreError(Exception):
 
 
 @dataclass(frozen=True)
-class Team:
+class TeamRow:
+    from_date: date | None
+    to_date: date | None
     total_hc: float
     throughput_per_day: float
 
@@ -72,6 +76,19 @@ def parse_date(value: str, field: str = "date") -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         raise StoreError(f"invalid {field}: {value!r} (expected YYYY-MM-DD)")
+
+
+def _parse_progress_date(value: str) -> date:
+    """Parse a progress date. Sheets may export dates as 'YYYY-MM-DD HH:MM:SS'."""
+    value = value.strip()
+    parsed = parse_date(value)
+    if parsed is not None:
+        return parsed
+    if len(value) > 10:
+        parsed = parse_date(value[:10])
+        if parsed is not None:
+            return parsed
+    raise StoreError(f"invalid date: {value!r} (expected YYYY-MM-DD)")
 
 
 def validate_data_type(value: str) -> str:
@@ -113,17 +130,56 @@ def _parse_float(value: str, field: str) -> float:
         raise StoreError(f"invalid {field}: {value!r} (expected a number)")
 
 
-def _parse_progress_date(value: str) -> date:
-    """Parse a progress date. Sheets may export dates as 'YYYY-MM-DD HH:MM:SS'."""
-    value = value.strip()
-    parsed = parse_date(value)
-    if parsed is not None:
-        return parsed
-    if len(value) > 10:
-        parsed = parse_date(value[:10])
-        if parsed is not None:
-            return parsed
-    raise StoreError(f"invalid date: {value!r} (expected YYYY-MM-DD)")
+def _validate_team_row(row: TeamRow) -> None:
+    if row.total_hc < 0:
+        raise StoreError("total_hc must be >= 0")
+    if row.throughput_per_day <= 0:
+        raise StoreError("throughput_per_day must be > 0")
+    if row.from_date and row.to_date and row.from_date > row.to_date:
+        raise StoreError("from_date must not be after to_date")
+
+
+def _ranges_overlap(a: TeamRow, b: TeamRow) -> bool:
+    """True if the two date ranges share at least one calendar day.
+
+    An open-ended side extends only up to the other row's boundary: a row
+    (…, 2025-01-31) and a row (2025-02-01, …) do NOT overlap, while a row
+    (…, None) and a row (2025-02-01, …) DO (the open-ended row covers
+    2025-02-01 onwards). Two rows both open on the same side overlap.
+    """
+    a_start = a.from_date or date.min
+    a_end = a.to_date or date.max
+    b_start = b.from_date or date.min
+    b_end = b.to_date or date.max
+    if a_start > b_end or b_start > a_end:
+        return False
+    # If both rows are bounded on the same side, the interval check above
+    # already decided: no shared day. Only open-ended sides need extra care,
+    # because date.min/date.max placeholders can mask a real gap.
+    if a.from_date is None and a.to_date is None:
+        return True  # fully open row covers everything
+    if b.from_date is None and b.to_date is None:
+        return True
+    if a.from_date is None and b.from_date is None:
+        return True  # both extend left; ranges share days
+    if a.to_date is None and b.to_date is None:
+        return True  # both extend right; ranges share days
+    if a.from_date is None and b.to_date is None:
+        # a ends at a_end, b starts at b_start; overlap iff a reaches into b
+        return a_end >= b_start
+    if b.from_date is None and a.to_date is None:
+        return b_end >= a_start
+    if a.from_date is None:
+        # a is (..., a_end]; b is fully bounded -> overlap iff a reaches b
+        return a_end >= b_start
+    if b.from_date is None:
+        return b_end >= a_start
+    if a.to_date is None:
+        # a is [a_start, ...); b is fully bounded
+        return a_start <= b_end
+    if b.to_date is None:
+        return b_start <= a_end
+    return True
 
 
 class Store:
@@ -156,34 +212,69 @@ class Store:
             writer.writeheader()
             writer.writerows(rows)
 
-    # ----- team ------------------------------------------------------
+    # ----- team (date-ranged HC & throughput) ------------------------
 
-    def get_team(self) -> Team:
-        rows = self._read("team")
-        if not rows:
-            return Team(total_hc=0.0, throughput_per_day=0.0)
-        row = rows[0]
-        return Team(
-            total_hc=_parse_float(row["total_hc"], "total_hc"),
-            throughput_per_day=_parse_float(
-                row["throughput_per_day"], "throughput_per_day"
-            ),
-        )
+    def list_team_rows(self) -> list[TeamRow]:
+        out = []
+        for row in self._read("team"):
+            out.append(
+                TeamRow(
+                    from_date=parse_date(row.get("from_date", ""), "from_date"),
+                    to_date=parse_date(row.get("to_date", ""), "to_date"),
+                    total_hc=_parse_float(row["total_hc"], "total_hc"),
+                    throughput_per_day=_parse_float(
+                        row["throughput_per_day"], "throughput_per_day"
+                    ),
+                )
+            )
+        return out
 
-    def set_team(self, team: Team) -> None:
-        if team.total_hc < 0:
-            raise StoreError("total_hc must be >= 0")
-        if team.throughput_per_day <= 0:
-            raise StoreError("throughput_per_day must be > 0")
+    def team_on(self, day: date) -> TeamRow | None:
+        for row in self.list_team_rows():
+            if (row.from_date is None or day >= row.from_date) and (
+                row.to_date is None or day <= row.to_date
+            ):
+                return row
+        return None
+
+    def add_team_row(self, row: TeamRow) -> None:
+        _validate_team_row(row)
+        rows = self.list_team_rows()
+        for existing in rows:
+            if _ranges_overlap(row, existing):
+                raise StoreError(
+                    "team row overlaps an existing row "
+                    f"({existing.from_date or '...'}..{existing.to_date or '...'})"
+                )
+        rows.append(row)
+        self.replace_team_rows(rows)
+
+    def replace_team_rows(self, rows: list[TeamRow]) -> None:
+        for row in rows:
+            _validate_team_row(row)
+        for i, a in enumerate(rows):
+            for b in rows[i + 1 :]:
+                if _ranges_overlap(a, b):
+                    raise StoreError(
+                        "team rows overlap: "
+                        f"({a.from_date or '...'}..{a.to_date or '...'}) and "
+                        f"({b.from_date or '...'}..{b.to_date or '...'})"
+                    )
         self._write(
             "team",
             [
                 {
-                    "total_hc": str(team.total_hc),
-                    "throughput_per_day": str(team.throughput_per_day),
+                    "from_date": r.from_date.isoformat() if r.from_date else "",
+                    "to_date": r.to_date.isoformat() if r.to_date else "",
+                    "total_hc": str(r.total_hc),
+                    "throughput_per_day": str(r.throughput_per_day),
                 }
+                for r in rows
             ],
         )
+
+    def clear_team_rows(self) -> None:
+        self._write("team", [])
 
     # ----- lanes -----------------------------------------------------
 
@@ -296,7 +387,9 @@ class Store:
         for lane in lanes:
             key = (lane.data_type, lane.purpose, lane.batch)
             if key in seen:
-                raise StoreError(f"duplicate lane {lane.data_type}/{lane.purpose}/{lane.batch}")
+                raise StoreError(
+                    f"duplicate lane {lane.data_type}/{lane.purpose}/{lane.batch}"
+                )
             seen.add(key)
         self._write(
             "lanes",
@@ -357,8 +450,12 @@ class Store:
         rows = self._read("progress")
         for row in rows:
             d = _parse_progress_date(row["date"])
-            key = (d, row["data_type"].strip(), row["purpose"].strip(),
-                   row["batch"].strip())
+            key = (
+                d,
+                row["data_type"].strip(),
+                row["purpose"].strip(),
+                row["batch"].strip(),
+            )
             existing[key] = existing.get(key, 0) + _parse_int(
                 row["items_completed"], "items_completed"
             )
@@ -371,11 +468,14 @@ class Store:
             if key in existing:
                 existing[key] += e.items_completed
                 updated += 1
-                # update the first matching row in place
                 for row in rows:
                     rd = _parse_progress_date(row["date"])
-                    rkey = (rd, row["data_type"].strip(), row["purpose"].strip(),
-                            row["batch"].strip())
+                    rkey = (
+                        rd,
+                        row["data_type"].strip(),
+                        row["purpose"].strip(),
+                        row["batch"].strip(),
+                    )
                     if rkey == key:
                         row["items_completed"] = str(existing[key])
                         break

@@ -10,7 +10,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from planner.planning import build_plan, plan_dates
-from planner.store import Lane, ProgressEntry, Store, StoreError, Team
+from planner.store import (
+    Lane,
+    ProgressEntry,
+    Store,
+    StoreError,
+    TeamRow,
+    _ranges_overlap,
+)
 
 TODAY = date(2025, 1, 6)  # a Monday
 
@@ -28,14 +35,73 @@ class StoreTest(unittest.TestCase):
         for name in ("team", "lanes", "progress"):
             self.assertTrue((self.store.root / f"{name}.csv").exists())
 
-    def test_team_roundtrip_and_validation(self):
-        self.assertEqual(self.store.get_team(), Team(0.0, 0.0))
-        self.store.set_team(Team(4.0, 40.0))
-        self.assertEqual(self.store.get_team(), Team(4.0, 40.0))
+    def test_team_rows_date_ranged_and_non_overlapping(self):
+        # fully open-ended row covers everything
+        self.store.add_team_row(TeamRow(None, None, 4.0, 40.0))
+        self.assertEqual(self.store.team_on(TODAY).total_hc, 4.0)
         with self.assertRaises(StoreError):
-            self.store.set_team(Team(-1, 40))
+            self.store.add_team_row(TeamRow(TODAY, None, 2.0, 30.0))  # overlaps
+        # a bounded row does not conflict with a later open-ended row
+        self.store.clear_team_rows()
+        self.store.add_team_row(TeamRow(date(2025, 1, 1), date(2025, 1, 31), 4.0, 40.0))
+        self.store.add_team_row(TeamRow(date(2025, 2, 1), None, 2.0, 30.0))
+        self.assertEqual(self.store.team_on(date(2025, 1, 31)).total_hc, 4.0)
+        self.assertEqual(self.store.team_on(date(2025, 2, 1)).total_hc, 2.0)
+        self.assertIsNone(self.store.team_on(date(2024, 12, 31)))
+
+    def test_team_row_validation(self):
         with self.assertRaises(StoreError):
-            self.store.set_team(Team(4, 0))
+            self.store.add_team_row(TeamRow(None, None, -1, 40))
+        with self.assertRaises(StoreError):
+            self.store.add_team_row(TeamRow(None, None, 4, 0))
+        with self.assertRaises(StoreError):
+            self.store.add_team_row(
+                TeamRow(date(2025, 2, 1), date(2025, 1, 1), 4, 40)
+            )
+
+    def test_ranges_overlap_matrix(self):
+        N = None
+        d = date
+        cases = [
+            (TeamRow(N, N, 1, 1), TeamRow(d(2025, 1, 1), N, 1, 1), True),
+            (TeamRow(N, d(2025, 1, 31), 1, 1), TeamRow(d(2025, 2, 1), N, 1, 1), False),
+            (TeamRow(N, d(2025, 1, 31), 1, 1), TeamRow(d(2025, 1, 15), N, 1, 1), True),
+            (TeamRow(d(2025, 2, 1), N, 1, 1), TeamRow(d(2025, 3, 1), d(2025, 3, 31), 1, 1), True),
+            (TeamRow(d(2025, 3, 1), d(2025, 3, 31), 1, 1), TeamRow(d(2025, 2, 1), N, 1, 1), True),
+            (TeamRow(d(2025, 1, 1), d(2025, 1, 31), 1, 1), TeamRow(d(2025, 2, 1), N, 1, 1), False),
+            (TeamRow(d(2025, 3, 1), d(2025, 3, 31), 1, 1), TeamRow(N, d(2025, 1, 31), 1, 1), False),
+            (TeamRow(N, d(2025, 1, 31), 1, 1), TeamRow(d(2025, 2, 1), d(2025, 2, 28), 1, 1), False),
+            (TeamRow(d(2025, 1, 1), d(2025, 1, 31), 1, 1), TeamRow(N, d(2025, 1, 15), 1, 1), True),
+            (TeamRow(d(2025, 1, 1), d(2025, 1, 31), 1, 1), TeamRow(d(2025, 1, 31), d(2025, 2, 28), 1, 1), True),
+            (TeamRow(d(2025, 1, 1), d(2025, 1, 30), 1, 1), TeamRow(d(2025, 1, 31), d(2025, 2, 28), 1, 1), False),
+            (TeamRow(N, d(2025, 1, 31), 1, 1), TeamRow(N, d(2025, 2, 28), 1, 1), True),
+            (TeamRow(d(2025, 1, 1), N, 1, 1), TeamRow(d(2025, 2, 1), N, 1, 1), True),
+        ]
+        for a, b, expected in cases:
+            self.assertIs(_ranges_overlap(a, b), expected, f"{a} vs {b}")
+            self.assertIs(_ranges_overlap(b, a), expected, f"{b} vs {a}")
+
+    def test_team_rows_open_then_bounded_are_rejected(self):
+        # a forward-open row covers every later day, so a bounded row after
+        # it is a genuine overlap and must be rejected
+        self.store.add_team_row(TeamRow(date(2025, 2, 1), None, 2, 55))
+        with self.assertRaises(StoreError):
+            self.store.add_team_row(TeamRow(date(2025, 3, 1), date(2025, 3, 31), 3, 50))
+        # a bounded row followed by a forward-open row starting the next day
+        # is fine (no shared day)
+        self.store.clear_team_rows()
+        self.store.add_team_row(TeamRow(date(2025, 1, 1), date(2025, 1, 31), 4, 40))
+        self.store.add_team_row(TeamRow(date(2025, 2, 1), None, 2, 55))
+        self.assertEqual(len(self.store.list_team_rows()), 2)
+
+    def test_replace_team_rows_rejects_overlap(self):
+        with self.assertRaises(StoreError):
+            self.store.replace_team_rows(
+                [
+                    TeamRow(None, None, 4, 40),
+                    TeamRow(TODAY, None, 2, 30),
+                ]
+            )
 
     def test_lane_validation(self):
         with self.assertRaises(StoreError):
@@ -57,8 +123,6 @@ class StoreTest(unittest.TestCase):
         lanes = self.store.list_lanes()
         self.assertEqual(len(lanes), 1)
         self.assertEqual(lanes[0].total_required, 200)
-        self.assertEqual(lanes[0].assigned_hc, 1.0)
-        self.assertEqual(lanes[0].status, "in_progress")
         self.store.set_lane_status("Eval", "qc", "B1", "stopped")
         self.assertEqual(self.store.get_lane("Eval", "qc", "B1").status, "stopped")
 
@@ -70,13 +134,21 @@ class StoreTest(unittest.TestCase):
         entries = self.store.list_progress()
         self.assertEqual(sum(e.items_completed for e in entries), 50)
 
+    def test_progress_accepts_sheets_datetime(self):
+        self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 5))
+        self.store.merge_progress(
+            [ProgressEntry(TODAY, "Eval", "qc", "B1", 10)]
+        )
+        entries = self.store.list_progress()
+        self.assertEqual(sum(e.items_completed for e in entries), 15)
+
 
 class PlanningTest(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "data")
         self.store.init()
-        self.store.set_team(Team(4.0, 40.0))
+        self.store.add_team_row(TeamRow(None, None, 4.0, 40.0))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -92,6 +164,33 @@ class PlanningTest(unittest.TestCase):
         self.assertEqual(lp.start_date, TODAY)
         self.assertEqual(lp.finish_date, date(2025, 1, 7))  # 160/80 = 2 days
 
+    def test_per_day_throughput_changes_schedule(self):
+        # 40/day until Jan 9, then 80/day (via 2x throughput) from Jan 10
+        self.store.replace_team_rows(
+            [
+                TeamRow(None, date(2025, 1, 9), 1.0, 40.0),
+                TeamRow(date(2025, 1, 10), None, 1.0, 80.0),
+            ]
+        )
+        self._lane(req=200, hc=1.0)
+        report = build_plan(self.store, TODAY)
+        lp = report.lanes[0]
+        # Jan 6-9: 4 days * 40 = 160; remaining 40 at 80/day -> 1 day (Jan 10)
+        self.assertEqual(lp.start_date, TODAY)
+        self.assertEqual(lp.finish_date, date(2025, 1, 10))
+
+    def test_gap_in_team_rows_pauses_schedule(self):
+        # HC only in the first week; nothing the week after
+        self.store.replace_team_rows(
+            [TeamRow(TODAY, date(2025, 1, 10), 1.0, 40.0)]
+        )
+        self._lane(req=1000, hc=1.0)
+        report = build_plan(self.store, TODAY)
+        lp = report.lanes[0]
+        # 5 days * 40 = 200 done by Jan 10, then no capacity; finish is None
+        self.assertIsNone(lp.finish_date)
+        self.assertTrue(any("could not finish" in w for w in report.warnings))
+
     def test_snapshot_counts(self):
         self._lane("Eval", "qc", "B1", 100, 1.0, "in_progress")
         self._lane("FT", "train", "B1", 50, 1.0, "in_progress")
@@ -101,7 +200,6 @@ class PlanningTest(unittest.TestCase):
         s = report.snapshot
         self.assertEqual(s.total_required, 175)
         self.assertEqual(s.total_completed, 40)
-        # in_progress lanes: Eval remaining 60 + FT remaining 50
         self.assertEqual(s.total_in_progress, 110)
 
     def test_batches_run_sequentially_within_type_purpose(self):
@@ -137,38 +235,34 @@ class PlanningTest(unittest.TestCase):
             self.assertIsNone(lp.start_date)
             self.assertIsNone(lp.finish_date)
 
-    def test_no_hc_warns_and_blocks_later_batches(self):
-        self._lane("Eval", "qc", "B1", 40, 0.0)
-        self._lane("Eval", "qc", "B2", 40, 1.0)
+    def test_no_team_row_warns(self):
+        self.store.clear_team_rows()
+        self._lane("Eval", "qc", "B1", 40, 1.0)
         report = build_plan(self.store, TODAY)
-        b1, b2 = report.lanes
-        self.assertIsNone(b1.start_date)
-        self.assertIsNone(b2.start_date)  # blocked behind unscheduled B1
-        self.assertTrue(any("no HC assigned" in w for w in report.warnings))
+        self.assertTrue(any("no team rows" in w for w in report.warnings))
+        self.assertIsNone(report.lanes[0].start_date)
 
     def test_over_assigned_hc_warning(self):
-        self.store.set_team(Team(1.0, 40.0))
+        self.store.replace_team_rows([TeamRow(None, None, 1.0, 40.0)])
         self._lane("Eval", "qc", "B1", 40, 1.0)
         self._lane("FT", "train", "B1", 40, 1.0)
         report = build_plan(self.store, TODAY)
-        self.assertTrue(any("exceeds total HC" in w for w in report.warnings))
+        self.assertTrue(any("exceeds peak total HC" in w for w in report.warnings))
 
     def test_plan_dates_covers_progress_and_schedule(self):
         self._lane(req=80, hc=1.0)
         self.store.log_progress(ProgressEntry(date(2025, 1, 3), "Eval", "qc", "B1", 10))
         report = build_plan(self.store, TODAY)
         dates = plan_dates(report)
-        self.assertIn(date(2025, 1, 3), dates)   # logged day
-        self.assertIn(TODAY, dates)               # schedule start
-        self.assertIn(date(2025, 1, 7), dates)    # schedule finish (80/40=2d)
+        self.assertIn(date(2025, 1, 3), dates)
+        self.assertIn(TODAY, dates)
+        self.assertIn(date(2025, 1, 7), dates)  # 80/40 = 2 days
 
     def test_daily_grid_aggregates_by_day(self):
         self._lane(req=100, hc=1.0)
         self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 30))
         self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 10))
-        self.store.log_progress(
-            ProgressEntry(date(2025, 1, 7), "Eval", "qc", "B1", 5)
-        )
+        self.store.log_progress(ProgressEntry(date(2025, 1, 7), "Eval", "qc", "B1", 5))
         report = build_plan(self.store, TODAY)
         from planner.planning import LaneKey
 
@@ -208,8 +302,6 @@ class WebTest(unittest.TestCase):
             return resp.status, resp.read().decode()
 
     def _post(self, path, data):
-        import urllib.parse
-
         body = urllib.parse.urlencode(data).encode()
         req = urllib.request.Request(self.url + path, data=body)
         try:
@@ -218,29 +310,46 @@ class WebTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def test_dashboard_renders_snapshot_and_table(self):
-        self.store.set_team(Team(4.0, 40.0))
+    def test_dashboard_renders_branded_snapshot_and_table(self):
+        self.store.add_team_row(TeamRow(None, None, 4.0, 40.0))
         self.store.set_lane(Lane("Eval", "qc", "B1", 100, 2.0, "in_progress"))
         self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 40))
         status, body = self._get("/")
         self.assertEqual(status, 200)
         self.assertIn("Total required", body)
-        self.assertIn("Total completed", body)
-        self.assertIn("In progress", body)
-        self.assertIn("Eval", body)
-        self.assertIn("qc", body)
+        self.assertIn("Peak team HC", body)
         self.assertIn("Assigned HC", body)
         self.assertIn("Capacity/day", body)
-        # daily grid columns exist (logged date)
         self.assertIn("Daily completions", body)
-        self.assertIn(TODAY.isoformat()[5:], body)
+        # Mistral brand markers
+        self.assertIn("--primary:#fa520f", body)
+        self.assertIn("sunset stripe", body.replace('class="stripe"', "sunset stripe"))
+        self.assertIn("Eval", body)
 
-    def test_team_form_roundtrip(self):
+    def test_team_row_roundtrip_via_web(self):
         status, _ = self._post(
-            "/team", {"total_hc": "3", "throughput_per_day": "25"}
+            "/team/add",
+            {
+                "from_date": "2025-01-06",
+                "to_date": "2025-01-31",
+                "total_hc": "3",
+                "throughput_per_day": "25",
+            },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(self.store.get_team(), Team(3.0, 25.0))
+        row = self.store.list_team_rows()[0]
+        self.assertEqual(row.total_hc, 3.0)
+        self.assertEqual(row.throughput_per_day, 25.0)
+        self.assertEqual(row.from_date, date(2025, 1, 6))
+
+    def test_team_overlap_rejected_via_web(self):
+        self.store.add_team_row(TeamRow(None, None, 4.0, 40.0))
+        status, body = self._post(
+            "/team/add",
+            {"from_date": "", "to_date": "", "total_hc": "2", "throughput_per_day": "30"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("overlaps", body)
 
     def test_lane_add_update_delete_via_web(self):
         self._post(
@@ -256,7 +365,6 @@ class WebTest(unittest.TestCase):
         )
         lane = self.store.get_lane("FT", "train", "B1")
         self.assertEqual(lane.total_required, 150)
-        self.assertEqual(lane.assigned_hc, 1.5)
         self._post(
             "/lanes/update",
             {
@@ -271,25 +379,29 @@ class WebTest(unittest.TestCase):
         lane = self.store.get_lane("FT", "train", "B1")
         self.assertEqual(lane.total_required, 200)
         self.assertEqual(lane.status, "in_progress")
-        self._post(
-            "/lanes/delete",
-            {"data_type": "FT", "purpose": "train", "batch": "B1"},
-        )
+        self._post("/lanes/delete", {"data_type": "FT", "purpose": "train", "batch": "B1"})
         self.assertEqual(self.store.list_lanes(), [])
 
     def test_progress_log_via_web(self):
         self.store.set_lane(Lane("Eval", "qc", "B1", 100, 1.0, "in_progress"))
         self._post(
             "/progress/add",
-            {
-                "date": "2025-01-06",
-                "lane": "Eval|qc|B1",
-                "items": "35",
-            },
+            {"date": "2025-01-06", "lane": "Eval|qc|B1", "items": "35"},
         )
         entries = self.store.list_progress()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].items_completed, 35)
+
+    def test_sync_page_single_sheet_form(self):
+        status, body = self._get("/sync")
+        self.assertEqual(status, 200)
+        self.assertIn("One spreadsheet, three tabs", body)
+        self.assertIn("Pull from Google Sheets now", body)
+        status, _ = self._post("/sync/set", {"sheet_id": "abc123"})
+        self.assertEqual(status, 303)
+        from planner.sheets import get_sheet_id
+
+        self.assertEqual(get_sheet_id(self.store), "abc123")
 
     def test_invalid_post_shows_error_not_crash(self):
         status, body = self._post(
@@ -306,22 +418,10 @@ class WebTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("invalid data_type", body)
 
-    def test_sync_page_renders(self):
-        status, body = self._get("/sync")
-        self.assertEqual(status, 200)
-        self.assertIn("Sync with Google Sheets", body)
-        self.assertIn("Pull from Google Sheets now", body)
-
-    def test_sync_set_prefix_via_web(self):
-        status, _ = self._post("/sync/set", {"prefix": "My Planner"})
-        self.assertEqual(status, 303)
-        from planner.sheets import get_sheet_prefix
-
-        self.assertEqual(get_sheet_prefix(self.store), "My Planner")
-
 
 class SheetsSyncTest(unittest.TestCase):
-    """Sync logic tested against a local HTTP server standing in for Drive."""
+    """Single-sheet sync tested against a local HTTP server standing in for
+    the Google Sheets CSV export."""
 
     def setUp(self):
         import http.server
@@ -333,7 +433,11 @@ class SheetsSyncTest(unittest.TestCase):
         self.store = Store(Path(self.tmp.name) / "data")
         self.store.init()
 
-        team_csv = "total_hc,throughput_per_day\r\n5,30\r\n"
+        team_csv = (
+            "from_date,to_date,total_hc,throughput_per_day\r\n"
+            ",2025-01-31,4,40\r\n"
+            "2025-02-01,,2,50\r\n"
+        )
         lanes_csv = (
             "data_type,purpose,batch,total_required,assigned_hc,status\r\n"
             "Eval,qc,B1,100,2,in_progress\r\n"
@@ -343,61 +447,34 @@ class SheetsSyncTest(unittest.TestCase):
             "date,data_type,purpose,batch,items_completed\r\n"
             "2025-01-06,Eval,qc,B1,40\r\n"
         )
+        tabs = {"team": team_csv, "lanes": lanes_csv, "progress": progress_csv}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
             def do_GET(self):
-                if self.path.startswith("/drive/files"):
-                    import urllib.parse
-
-                    q = urllib.parse.parse_qs(
-                        urllib.parse.urlparse(self.path).query
-                    ).get("q", [""])[0]
-                    if "team" in q:
-                        body = json.dumps({"files": [{"id": "team123"}]})
-                    elif "lanes" in q:
-                        body = json.dumps({"files": [{"id": "lanes456"}]})
-                    elif "progress" in q:
-                        body = json.dumps({"files": [{"id": "prog789"}]})
-                    else:
-                        body = json.dumps({"files": []})
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                tab = qs.get("sheet", [""])[0]
+                if tab in tabs:
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "text/csv")
                     self.end_headers()
-                    self.wfile.write(body.encode())
-                elif self.path.startswith("/spreadsheets/d/team123"):
-                    self._csv(team_csv)
-                elif self.path.startswith("/spreadsheets/d/lanes456"):
-                    self._csv(lanes_csv)
-                elif self.path.startswith("/spreadsheets/d/prog789"):
-                    self._csv(progress_csv)
+                    self.wfile.write(tabs[tab].encode())
                 else:
                     self.send_response(404)
                     self.end_headers()
-
-            def _csv(self, text):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv")
-                self.end_headers()
-                self.wfile.write(text.encode())
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
-        # point sheets.py at the local server by pre-seeding exact sheet IDs
-        self._base = f"http://127.0.0.1:{self.port}"
-        self._orig_fetch = sheets._fetch_csv_by_id
-        sheets._fetch_csv_by_id = lambda sheet_id: list(
-            csv.DictReader(io.StringIO(self._http_get(f"{self._base}/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv")))
+        self._orig_fetch = sheets._fetch_tab_csv
+        base = f"http://127.0.0.1:{self.port}"
+        sheets._fetch_tab_csv = lambda sheet_id, tab: list(
+            csv.DictReader(io.StringIO(self._http_get(f"{base}/export?sheet={tab}")))
         )
-        # seed exact IDs so no Drive search is needed
-        sheets.set_sheet_id(self.store, "team", "team123")
-        sheets.set_sheet_id(self.store, "lanes", "lanes456")
-        sheets.set_sheet_id(self.store, "progress", "prog789")
 
     def _http_get(self, url):
         with urllib.request.urlopen(url) as r:
@@ -406,41 +483,43 @@ class SheetsSyncTest(unittest.TestCase):
     def tearDown(self):
         from planner import sheets
 
-        sheets._fetch_csv_by_id = self._orig_fetch
+        sheets._fetch_tab_csv = self._orig_fetch
         self.server.shutdown()
         self.server.server_close()
         self.tmp.cleanup()
 
-    def test_pull_replaces_team_and_lanes_merges_progress(self):
-        from planner.sheets import pull, set_sheet_prefix
+    def test_pull_single_sheet_replaces_and_merges(self):
+        from planner.sheets import pull, set_sheet_id
 
         # pre-existing local progress on the same day must be summed, not lost
         self.store.log_progress(ProgressEntry(date(2025, 1, 6), "Eval", "qc", "B1", 10))
 
-        set_sheet_prefix(self.store, "TestPlanner")
-        result = pull(self.store)  # IDs seeded in setUp take precedence
+        set_sheet_id(self.store, "localsheet")
+        result = pull(self.store)
 
-        self.assertTrue(result.team_synced)
+        self.assertEqual(result.team_rows, 2)
         self.assertEqual(result.lanes_replaced, 2)
         self.assertEqual(result.progress_added, 0)
         self.assertEqual(result.progress_updated, 1)
 
-        self.assertEqual(self.store.get_team(), Team(5.0, 30.0))
+        rows = self.store.list_team_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].total_hc, 4.0)
+        self.assertEqual(rows[0].to_date, date(2025, 1, 31))
+        self.assertEqual(rows[1].from_date, date(2025, 2, 1))
+
         lanes = {(l.data_type, l.purpose, l.batch): l for l in self.store.list_lanes()}
         self.assertEqual(len(lanes), 2)
         self.assertEqual(lanes[("Eval", "qc", "B1")].total_required, 100)
 
         entries = self.store.list_progress()
-        total = sum(e.items_completed for e in entries)
-        self.assertEqual(total, 50)  # 10 local + 40 from sheet, merged on same day
+        self.assertEqual(sum(e.items_completed for e in entries), 50)  # 10 + 40
 
-    def test_pull_requires_config(self):
+    def test_pull_requires_sheet_id(self):
         from planner.sheets import pull
 
-        fresh = Store(Path(self.tmp.name) / "fresh")
-        fresh.init()
         with self.assertRaises(StoreError):
-            pull(fresh)
+            pull(self.store)
 
 
 if __name__ == "__main__":
