@@ -25,14 +25,24 @@ Styled with Mistral brand assets.
 
 ### Option A — Render (free, recommended)
 
-1. Push this repository to your own GitHub account.
-2. Go to https://dashboard.render.com → **New +** → **Blueprint**.
-3. Connect the repository; Render reads `render.yaml` automatically.
-4. Click **Apply**. Render builds the Docker image and gives you a public URL
-   like `https://annotation-planner.onrender.com`.
-5. Open the URL — the dashboard is live. Data is stored on Render's disk
-   (`/app/data`, 1 GB on the free tier; it persists across restarts but is
-   wiped if you delete the service).
+1. Go to https://dashboard.render.com → **New +** → **Blueprint**.
+2. Connect the repository; Render reads `render.yaml` automatically.
+3. Click **Apply**. Render builds and gives you a public URL like
+   `https://annotation-planner.onrender.com`.
+4. Open the URL — the dashboard is live.
+
+**How data persists on the free tier** (no paid disk): the app pulls your
+Google Sheet into memory **on every start** (`PLANNER_SYNC_ON_START=1` in
+`render.yaml`). So:
+
+- Set the environment variable `ANNOTATION_SHEET_ID` to your sheet ID
+  (service → **Environment** tab → **Add Environment Variable**), then
+  redeploy (Manual Deploy → Deploy latest commit).
+- Your sheet is the source of truth. Anything you log in the UI lives until
+  the service restarts or redeploys (free tier spins down after ~15 min idle
+  and wipes its local state); after a restart the sheet is re-pulled.
+- Logging the same day twice in the UI adds to that day's number instead of
+  creating a duplicate row, so a sheet re-pull never double-counts.
 
 ### Option B — Docker (any server / your own machine)
 

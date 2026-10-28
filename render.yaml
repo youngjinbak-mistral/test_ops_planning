@@ -1,5 +1,7 @@
 # Deploy to Render (https://render.com): New -> Blueprint, point at this repo.
-# Free tier is enough. Set ANNOTATION_SHEET_ID in the environment after deploy.
+# Free tier is enough (no disk: the app pulls the Google Sheet on every start;
+# anything logged in the UI lives until the next restart/redeploy).
+# Set ANNOTATION_SHEET_ID in the environment so sync-on-start works.
 services:
   - type: web
     name: annotation-planner
@@ -14,9 +16,7 @@ services:
         value: "8000"
       - key: PLANNER_DATA_DIR
         value: /app/data
+      - key: PLANNER_SYNC_ON_START
+        value: "1"
       # - key: ANNOTATION_SHEET_ID
       #   value: <your-google-sheet-id>
-    disk:
-      name: planner-data
-      mountPath: /app/data
-      sizeGB: 1

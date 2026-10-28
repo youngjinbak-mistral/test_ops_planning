@@ -11,6 +11,7 @@ Run:  python3 -m planner.cli --dir data web --port 8000
 from __future__ import annotations
 
 import html
+import os
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -585,6 +586,23 @@ def _split_lane_field(value: str) -> tuple[str, str, str]:
 
 def make_server(store: Store, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     store.init()  # make sure the CSV files exist before serving
+    if os.environ.get("PLANNER_SYNC_ON_START") == "1":
+        from .sheets import get_sheet_id, pull
+
+        sheet_id = get_sheet_id(store)
+        if sheet_id:
+            try:
+                result = pull(store, sheet_id)
+                print(
+                    f"synced from Google Sheet {sheet_id}: "
+                    f"{result.team_rows} team rows, {result.lanes_replaced} lanes, "
+                    f"{result.progress_added} progress entries added, "
+                    f"{result.progress_updated} updated"
+                )
+            except Exception as exc:  # noqa: BLE001 - never block startup on sync
+                print(f"sync-on-start skipped: {exc}")
+        else:
+            print("sync-on-start enabled but no sheet configured (set ANNOTATION_SHEET_ID)")
     server = ThreadingHTTPServer((host, port), PlannerHandler)
     server.store = store  # type: ignore[attr-defined]
     return server

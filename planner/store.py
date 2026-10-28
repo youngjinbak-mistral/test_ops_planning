@@ -425,9 +425,27 @@ class Store:
         return out
 
     def log_progress(self, entry: ProgressEntry) -> None:
+        """Log items completed on a day for a task.
+
+        If an entry for the same (date, task) already exists, the items are
+        added to it — logging the same day twice never double-creates a row.
+        """
         if entry.items_completed <= 0:
             raise StoreError("items_completed must be > 0")
         rows = self._read("progress")
+        for row in rows:
+            if (
+                _parse_progress_date(row["date"]) == entry.date
+                and row["data_type"].strip() == entry.data_type
+                and row["purpose"].strip() == entry.purpose
+                and row["batch"].strip() == entry.batch
+            ):
+                row["items_completed"] = str(
+                    _parse_int(row["items_completed"], "items_completed")
+                    + entry.items_completed
+                )
+                self._write("progress", rows)
+                return
         rows.append(
             {
                 "date": entry.date.isoformat(),

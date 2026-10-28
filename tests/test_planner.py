@@ -134,6 +134,19 @@ class StoreTest(unittest.TestCase):
         entries = self.store.list_progress()
         self.assertEqual(sum(e.items_completed for e in entries), 50)
 
+    def test_log_progress_sums_same_day_in_place(self):
+        self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 30))
+        self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 20))
+        entries = self.store.list_progress()
+        # one row, summed — not two rows
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].items_completed, 50)
+        # a different day still gets its own row
+        self.store.log_progress(ProgressEntry(date(2025, 1, 7), "Eval", "qc", "B1", 5))
+        entries = self.store.list_progress()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(sum(e.items_completed for e in entries), 55)
+
     def test_progress_accepts_sheets_datetime(self):
         self.store.log_progress(ProgressEntry(TODAY, "Eval", "qc", "B1", 5))
         self.store.merge_progress(
