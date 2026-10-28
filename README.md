@@ -34,9 +34,10 @@ Styled with Mistral brand assets.
 **Port**: Render injects a `PORT` environment variable (usually 10000) and the
 app listens on it automatically — no port configuration needed.
 
-**How data persists on the free tier** (no paid disk): the app pulls your
-Google Sheet into memory **on every start** (`PLANNER_SYNC_ON_START=1` in
-`render.yaml`). So:
+**How data persists on the free tier** (no paid disk, read-only `/app`): the
+app detects the read-only workdir, uses a temp directory instead, and pulls
+your Google Sheet into memory **on every start** (`PLANNER_SYNC_ON_START=1`
+in `render.yaml`). So:
 
 - Set the environment variable `ANNOTATION_SHEET_ID` to your sheet ID
   (service → **Environment** tab → **Add Environment Variable**), then
@@ -129,7 +130,8 @@ source of truth and can be edited directly in Excel/LibreOffice/Google Sheets
 
 Configuration:
 
-- `PLANNER_DATA_DIR` — where the CSVs live (default `./data`)
+- `PLANNER_DATA_DIR` — where the CSVs live (default `./data`; if that is not
+  writable — e.g. a read-only container `/app` — the app falls back to a temp dir)
 - `PLANNER_HOST` / `PLANNER_PORT` — web UI bind address (default `127.0.0.1:8000`);
   the standard `PORT` variable (set by Render, Fly, Heroku, ...) takes precedence
 - `ANNOTATION_SHEET_ID` — default Google Sheet for sync

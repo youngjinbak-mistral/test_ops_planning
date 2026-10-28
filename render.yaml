@@ -13,8 +13,8 @@ services:
       - key: PLANNER_HOST
         value: 0.0.0.0
       # Render injects PORT automatically; the app prefers it over PLANNER_PORT.
-      - key: PLANNER_DATA_DIR
-        value: /app/data
+      # /app is read-only on Render; the app falls back to a temp dir and
+      # re-pulls the Google Sheet on every start, so nothing is lost.
       - key: PLANNER_SYNC_ON_START
         value: "1"
       # - key: ANNOTATION_SHEET_ID

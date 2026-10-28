@@ -313,11 +313,36 @@ def cmd_plan(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_data_dir() -> str:
+    """Default data directory.
+
+    On container hosts (Render, Docker) /app is read-only, so fall back to a
+    writable temp dir instead of failing with PermissionError.
+    """
+    candidate = Path("data")
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        return str(candidate)
+    except OSError:
+        import tempfile
+
+        fallback = Path(tempfile.gettempdir()) / "annotation-planner-data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        print(
+            f"note: ./data is not writable here; using {fallback}",
+            file=sys.stderr,
+        )
+        return str(fallback)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="annotation-planner")
     parser.add_argument(
         "--dir",
-        default=os.environ.get("PLANNER_DATA_DIR", "data"),
+        default=os.environ.get("PLANNER_DATA_DIR") or _default_data_dir(),
         help="directory holding the CSV files (default: ./data, or PLANNER_DATA_DIR)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -409,7 +434,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = Store(Path(args.dir))
     if args.func is not cmd_init:
-        store.init()  # auto-create the CSV files so every command just works
+        try:
+            store.init()  # auto-create the CSV files so every command just works
+        except OSError as exc:
+            # Read-only workdir (e.g. Render's /app): fall back to a temp dir
+            # and re-init there. Data comes back from the sheet sync anyway.
+            import tempfile
+
+            fallback = Path(tempfile.gettempdir()) / "annotation-planner-data"
+            print(
+                f"note: {store.root} is not writable ({exc}); using {fallback}",
+                file=sys.stderr,
+            )
+            store = Store(fallback)
+            store.init()
     try:
         return args.func(store, args)
     except StoreError as exc:

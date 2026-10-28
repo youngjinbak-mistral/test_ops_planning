@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 from datetime import date
 from pathlib import Path
+import tempfile
 from tempfile import TemporaryDirectory
 
 from planner.planning import build_plan, plan_dates
@@ -282,6 +283,27 @@ class PlanningTest(unittest.TestCase):
         key = LaneKey("Eval", "qc", "B1")
         self.assertEqual(report.daily[TODAY][key], 40)
         self.assertEqual(report.daily[date(2025, 1, 7)][key], 5)
+
+
+class ReadOnlyDirFallbackTest(unittest.TestCase):
+    def test_main_falls_back_when_dir_not_writable(self):
+        import os
+        import stat
+
+        from planner.cli import main
+
+        tmp = TemporaryDirectory()
+        ro = Path(tmp.name) / "ro"
+        ro.mkdir()
+        ro.chmod(stat.S_IRUSR | stat.S_IXUSR)  # read+execute, no write
+        try:
+            code = main(["--dir", str(ro / "data"), "team", "list"])
+            self.assertEqual(code, 0)
+            fallback = Path(tempfile.gettempdir()) / "annotation-planner-data"
+            self.assertTrue((fallback / "team.csv").exists())
+        finally:
+            ro.chmod(stat.S_IRWXU)
+        tmp.cleanup()
 
 
 class CliPortTest(unittest.TestCase):
