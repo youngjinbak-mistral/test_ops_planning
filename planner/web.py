@@ -139,6 +139,8 @@ _PAGE = """<!doctype html>
 </html>
 """
 
+DASH = "\u2014"  # em dash placeholder
+
 NAV_ITEMS = [
     ("/", "Dashboard"),
     ("/team", "Team"),
@@ -182,8 +184,13 @@ class PlannerHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _page(self, body: str, title: str, flash: str = "", error: str = "") -> None:
+        current = urlparse(self.path).path
         nav = "".join(
-            f'<a href="{href}"{" class=\"active\"" if href == urlparse(self.path).path else ""}>{label}</a>'
+            '<a href="{}"{}>{}</a>'.format(
+                esc(href),
+                ' class="active"' if href == current else "",
+                esc(label),
+            )
             for href, label in NAV_ITEMS
         )
         flash_html = ""
@@ -336,9 +343,9 @@ class PlannerHandler(BaseHTTPRequestHandler):
                 f'<td class="num">{lane.total_required}</td>'
                 f'<td class="num">{lp.completed}</td>'
                 f'<td class="num">{lp.pct_complete:.1f}%</td>'
-                f'<td class="num">{team_hc or "\u2014"}</td>'
+                f'<td class="num">{team_hc or DASH}</td>'
                 f'<td class="num">{lane.assigned_hc:g}</td>'
-                f'<td class="num">{throughput or "\u2014"}</td>'
+                f'<td class="num">{throughput or DASH}</td>'
                 f'<td class="num">{lp.capacity_per_day:.1f}</td>'
                 f"<td>{_badge(lane.status)}</td>"
                 f'<td class="num">{lp.start_date.isoformat() if lp.start_date else "—"}</td>'
