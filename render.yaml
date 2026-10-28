@@ -12,8 +12,7 @@ services:
     envVars:
       - key: PLANNER_HOST
         value: 0.0.0.0
-      - key: PLANNER_PORT
-        value: "8000"
+      # Render injects PORT automatically; the app prefers it over PLANNER_PORT.
       - key: PLANNER_DATA_DIR
         value: /app/data
       - key: PLANNER_SYNC_ON_START

@@ -327,7 +327,9 @@ def build_parser() -> argparse.ArgumentParser:
     w = sub.add_parser("web", help="launch the web UI")
     w.add_argument("--host", default=os.environ.get("PLANNER_HOST", "127.0.0.1"))
     w.add_argument(
-        "--port", type=int, default=int(os.environ.get("PLANNER_PORT", "8000"))
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT") or os.environ.get("PLANNER_PORT", "8000")),
     )
     w.set_defaults(func=cmd_web)
 

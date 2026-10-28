@@ -284,6 +284,36 @@ class PlanningTest(unittest.TestCase):
         self.assertEqual(report.daily[date(2025, 1, 7)][key], 5)
 
 
+class CliPortTest(unittest.TestCase):
+    def test_port_env_precedence(self):
+        import os
+
+        from planner.cli import build_parser
+
+        old_port = os.environ.get("PORT")
+        old_planner_port = os.environ.get("PLANNER_PORT")
+        try:
+            os.environ.pop("PORT", None)
+            os.environ.pop("PLANNER_PORT", None)
+            args = build_parser().parse_args(["web"])
+            self.assertEqual(args.port, 8000)
+            os.environ["PLANNER_PORT"] = "9000"
+            args = build_parser().parse_args(["web"])
+            self.assertEqual(args.port, 9000)
+            os.environ["PORT"] = "10000"  # Render injects this; it wins
+            args = build_parser().parse_args(["web"])
+            self.assertEqual(args.port, 10000)
+        finally:
+            if old_port is None:
+                os.environ.pop("PORT", None)
+            else:
+                os.environ["PORT"] = old_port
+            if old_planner_port is None:
+                os.environ.pop("PLANNER_PORT", None)
+            else:
+                os.environ["PLANNER_PORT"] = old_planner_port
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None

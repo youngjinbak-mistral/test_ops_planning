@@ -4,8 +4,7 @@ WORKDIR /app
 COPY planner ./planner
 
 ENV PLANNER_DATA_DIR=/app/data \
-    PLANNER_HOST=0.0.0.0 \
-    PLANNER_PORT=8000
+    PLANNER_HOST=0.0.0.0
 
 RUN python3 -m planner.cli init
 
